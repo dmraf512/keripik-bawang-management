@@ -14,12 +14,12 @@ import {
 } from 'recharts';
 import { ArrowRight, ChefHat, ClipboardList, Receipt } from 'lucide-react';
 import { useBusinessData } from '../context/DataContext';
+import { useBusinessMetrics } from '../hooks/useBusinessMetrics';
 import { DateFilterPeriod, PageId } from '../types/supabase';
 import {
   formatDateID,
   formatIDR,
   formatNumberID,
-  isCapitalWithdrawalType,
   isCashOutflowType,
   isWithinDateFilter,
 } from '../utils/formatters';
@@ -58,6 +58,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   onOpenNewOrder,
 }) => {
   const { db } = useBusinessData();
+  const {
+    totalCashBalance,
+    totalIngredientAssetValue,
+    orderPaymentStatusMap,
+    productionBatchCostMap,
+    getPeriodFinancials,
+  } = useBusinessMetrics();
   const [period, setPeriod] = useState<DateFilterPeriod>('month');
 
   const customerMap = useMemo(
@@ -78,14 +85,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     return map;
   }, [db.productSkus, db.productVariants]);
 
-  const paymentByOrderMap = useMemo(() => {
-    const map = new Map<string, number>();
-    db.orderPayments.forEach((p) => {
-      map.set(p.order_id, (map.get(p.order_id) ?? 0) + Number(p.amount));
-    });
-    return map;
-  }, [db.orderPayments]);
-
   const orderItemsByOrderMap = useMemo(() => {
     const map = new Map<string, number>();
     db.orderItems.forEach((item) => {
@@ -93,6 +92,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     });
     return map;
   }, [db.orderItems]);
+
+  const periodFinancials = useMemo(
+    () => getPeriodFinancials(period),
+    [getPeriodFinancials, period]
+  );
 
   const filteredData = useMemo(() => {
     const orders = db.orders.filter((o) => isWithinDateFilter(o.order_date, period));
@@ -109,55 +113,15 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       isWithinDateFilter(b.production_date, period)
     );
 
-    const totalPenjualan = orderPayments.reduce(
-      (sum, item) => sum + Number(item.amount),
-      0
-    );
-    const totalPengeluaran =
-      expenses.reduce((sum, e) => sum + Number(e.amount), 0) +
-      purchasePayments.reduce((sum, pp) => sum + Number(pp.amount), 0);
-
-    const totalModal = db.capitalTransactions.reduce((sum, c) => {
-      return isCapitalWithdrawalType(c.transaction_type)
-        ? sum - Number(c.amount)
-        : sum + Number(c.amount);
-    }, 0);
-
-    const batchIds = new Set(batches.map((b) => b.id));
-    const batchMaterialCost = db.productionMaterials
-      .filter((m) => batchIds.has(m.batch_id))
-      .reduce((s, m) => s + Number(m.total_cost), 0);
-    const batchExtraCost = db.productionCostItems
-      .filter((c) => batchIds.has(c.batch_id))
-      .reduce((s, c) => s + Number(c.amount), 0);
-    const productionCostTotal = batchMaterialCost + batchExtraCost;
-
-    const materialExpenses =
-      expenses
-        .filter((e) => {
-          const cat = e.category.toLowerCase();
-          return cat.includes('bahan') || cat.includes('kemasan');
-        })
-        .reduce((s, e) => s + Number(e.amount), 0) +
-      purchasePayments.reduce((s, pp) => s + Number(pp.amount), 0);
-
-    const hpp = productionCostTotal > 0 ? productionCostTotal : materialExpenses;
-    const labaKotor = totalPenjualan - hpp;
-    const labaBersih = totalPenjualan - totalPengeluaran;
-
     return {
       orders,
       orderPayments,
       expenses,
       purchasePayments,
       batches,
-      totalPenjualan,
-      totalPengeluaran,
-      totalModal,
-      labaKotor,
-      labaBersih,
+      ...periodFinancials,
     };
-  }, [db, period]);
+  }, [db, period, periodFinancials]);
 
   const chartSeries = useMemo(() => {
     const map = new Map<
@@ -182,12 +146,17 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       ensureBucket(p.payment_date).penjualan += Number(p.amount);
     });
 
-    filteredData.expenses.forEach((e) => {
-      ensureBucket(e.expense_date).pengeluaran += Number(e.amount);
+    filteredData.batches.forEach((b) => {
+      const batchCost = Number(
+        productionBatchCostMap.get(b.id)?.total_production_cost ?? 0
+      );
+      if (batchCost > 0) {
+        ensureBucket(b.production_date).pengeluaran += batchCost;
+      }
     });
 
-    filteredData.purchasePayments.forEach((pp) => {
-      ensureBucket(pp.payment_date).pengeluaran += Number(pp.amount);
+    filteredData.expenses.forEach((e) => {
+      ensureBucket(e.expense_date).pengeluaran += Number(e.amount);
     });
 
     return Array.from(map.values())
@@ -196,7 +165,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         ...row,
         laba: row.penjualan - row.pengeluaran,
       }));
-  }, [filteredData]);
+  }, [filteredData, productionBatchCostMap]);
 
   const recentTransactions = useMemo(() => {
     if (db.cashTransactions.length > 0) {
@@ -317,37 +286,57 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       </div>
 
       {/* 5 Financial Summary Cards */}
-      <section aria-label="Ringkasan Keuangan">
+      <section aria-label="Ringkasan Keuangan" className="space-y-4">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
           <StatCard
-            label="Total Penjualan"
-            value={formatIDR(filteredData.totalPenjualan)}
-            helperText={`${filteredData.orderPayments.length} pembayaran (${periodLabel})`}
+            label="Pendapatan Penjualan"
+            value={formatIDR(filteredData.collectedRevenue)}
+            helperText={`Nilai order: ${formatIDR(filteredData.salesOrderTotal)} (${filteredData.ordersCount} order)`}
             emphasis="positive"
           />
           <StatCard
-            label="Total Pengeluaran"
-            value={formatIDR(filteredData.totalPengeluaran)}
-            helperText={`${filteredData.expenses.length + filteredData.purchasePayments.length} catatan keluar`}
+            label="HPP Produksi Aktual"
+            value={formatIDR(filteredData.productionHpp)}
+            helperText={`${filteredData.batchesCount} batch (v_production_batch_costs)`}
             emphasis="negative"
           />
           <StatCard
-            label="Total Modal"
-            value={formatIDR(filteredData.totalModal)}
-            helperText={`${db.capitalTransactions.length} transaksi modal`}
-            emphasis="accent"
+            label="Laba Kotor"
+            value={formatIDR(filteredData.grossProfit)}
+            helperText="Pendapatan dikurangi HPP produksi"
+            emphasis={filteredData.grossProfit >= 0 ? 'default' : 'negative'}
           />
           <StatCard
-            label="Laba Kotor"
-            value={formatIDR(filteredData.labaKotor)}
-            helperText="Penjualan dikurangi biaya produksi"
-            emphasis={filteredData.labaKotor >= 0 ? 'default' : 'negative'}
+            label="Beban Operasional"
+            value={formatIDR(filteredData.operatingExpenses)}
+            helperText={`${filteredData.expensesCount} pengeluaran · Belanja bahan: ${formatIDR(filteredData.purchaseCashOutflow)}`}
+            emphasis="negative"
           />
           <StatCard
             label="Laba Bersih"
-            value={formatIDR(filteredData.labaBersih)}
-            helperText="Penjualan dikurangi total pengeluaran"
-            emphasis={filteredData.labaBersih >= 0 ? 'positive' : 'negative'}
+            value={formatIDR(filteredData.netProfit)}
+            helperText="Pendapatan - HPP - Operasional"
+            emphasis={filteredData.netProfit >= 0 ? 'positive' : 'negative'}
+          />
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <StatCard
+            label="Total Saldo Kas"
+            value={formatIDR(totalCashBalance)}
+            helperText="Sumber: v_cash_account_balances"
+          />
+          <StatCard
+            label="Nilai Aset Persediaan Bahan"
+            value={formatIDR(totalIngredientAssetValue)}
+            helperText="Sumber: v_ingredient_stock (aset, bukan beban)"
+            emphasis="accent"
+          />
+          <StatCard
+            label="Total Modal Usaha"
+            value={formatIDR(filteredData.totalModal)}
+            helperText={`${db.capitalTransactions.length} transaksi modal`}
+            emphasis="accent"
           />
         </div>
       </section>
@@ -414,7 +403,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               Grafik Pengeluaran
             </h3>
             <p className="text-xs text-[#8A7163]">
-              Biaya bahan & operasional ({periodLabel})
+              HPP produksi &amp; beban operasional ({periodLabel})
             </p>
           </div>
           {chartSeries.length === 0 ? (
@@ -456,7 +445,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               Grafik Laba
             </h3>
             <p className="text-xs text-[#8A7163]">
-              Selisih penjualan & pengeluaran ({periodLabel})
+              Selisih pendapatan terhadap HPP &amp; operasional ({periodLabel})
             </p>
           </div>
           {chartSeries.length === 0 ? (
@@ -544,13 +533,16 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                 </thead>
                 <tbody className="divide-y divide-[#F5EFE6] text-xs">
                   {recentOrders.map((order) => {
-                    const paid = paymentByOrderMap.get(order.id) ?? 0;
+                    const payView = orderPaymentStatusMap.get(order.id);
+                    const totalAmt = Number(payView?.total_amount ?? order.total_amount);
+                    const paid = Number(payView?.total_paid ?? 0);
                     const payStatus =
-                      paid >= Number(order.total_amount) && Number(order.total_amount) > 0
+                      payView?.payment_status ??
+                      (paid >= totalAmt && totalAmt > 0
                         ? 'Lunas'
                         : paid > 0
                         ? 'DP / Sebagian'
-                        : 'Belum Bayar';
+                        : 'Belum Bayar');
                     const qty = orderItemsByOrderMap.get(order.id) ?? 0;
                     const customerName = order.customer_id
                       ? customerMap.get(order.customer_id)?.name ?? 'Pelanggan'

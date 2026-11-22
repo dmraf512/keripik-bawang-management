@@ -70,7 +70,7 @@ export const ExpensesPage: React.FC = () => {
       notifyError('Keterangan pengeluaran wajib diisi.');
       return;
     }
-    if (amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       notifyError('Nominal pengeluaran harus lebih dari 0.');
       return;
     }
@@ -211,7 +211,7 @@ export const ExpensesPage: React.FC = () => {
                           onClick={() =>
                             void executeMutation(
                               () => supabaseService.deleteExpense(exp.id),
-                              'Catatan pengeluaran dihapus.'
+                              'Pengeluaran berhasil dihapus dan saldo kas disesuaikan melalui jurnal pembalik.'
                             )
                           }
                           aria-label="Hapus pengeluaran"
@@ -293,7 +293,8 @@ export const ExpensesPage: React.FC = () => {
                 </label>
                 <input
                   type="number"
-                  min={1}
+                  step="any"
+                  min="0.01"
                   required
                   value={amount}
                   onChange={(e) => setAmount(Number(e.target.value))}

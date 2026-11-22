@@ -1,12 +1,16 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { Session, User } from '@supabase/supabase-js';
 import {
+  ADMIN_USER_ID,
   DatabaseConnectionResult,
   mapSupabaseAuthError,
   supabase,
   supabaseConfig,
   verifyDatabaseConnection,
 } from '../lib/supabase';
+
+const UNAUTHORIZED_ADMIN_MESSAGE =
+  'Akses ditolak: hanya akun administrator utama yang diizinkan menggunakan sistem ini.';
 
 interface AuthContextValue {
   user: User | null;
@@ -41,6 +45,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setIsCheckingDb(false);
   }, []);
 
+  const rejectUnauthorizedUser = useCallback(async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
+    }
+    setSession(null);
+    setUser(null);
+    setDbStatus(null);
+    setAuthError(UNAUTHORIZED_ADMIN_MESSAGE);
+  }, []);
+
   useEffect(() => {
     if (!supabase) {
       setIsInitializing(false);
@@ -58,6 +72,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setAuthError(mapSupabaseAuthError(error));
           setSession(null);
           setUser(null);
+        } else if (data.session?.user && data.session.user.id !== ADMIN_USER_ID) {
+          await rejectUnauthorizedUser();
         } else {
           setSession(data.session);
           setUser(data.session?.user ?? null);
@@ -81,6 +97,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       if (!isMounted) return;
+      if (nextSession?.user && nextSession.user.id !== ADMIN_USER_ID) {
+        void rejectUnauthorizedUser();
+        return;
+      }
       setSession(nextSession);
       setUser(nextSession?.user ?? null);
       if (!nextSession) {
@@ -92,7 +112,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       isMounted = false;
       subscription.unsubscribe();
     };
-  }, []);
+  }, [checkDbConnection, rejectUnauthorizedUser]);
 
   const signIn = async (email: string, password: string): Promise<boolean> => {
     if (!supabase) {
@@ -120,6 +140,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (error) {
         setAuthError(mapSupabaseAuthError(error));
+        return false;
+      }
+
+      if (!data.user || data.user.id !== ADMIN_USER_ID) {
+        await rejectUnauthorizedUser();
         return false;
       }
 

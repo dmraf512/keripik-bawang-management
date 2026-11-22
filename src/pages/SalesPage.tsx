@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Plus, TrendingUp } from 'lucide-react';
 import { useBusinessData } from '../context/DataContext';
+import { useBusinessMetrics } from '../hooks/useBusinessMetrics';
 import { supabaseService } from '../services/supabaseService';
 import { formatDateID, formatIDR, getTodayISO } from '../utils/formatters';
 import { StatCard } from '../components/common/StatCard';
@@ -9,6 +10,7 @@ import { Modal } from '../components/common/Modal';
 
 export const SalesPage: React.FC = () => {
   const { db, isMutating, executeMutation, notifyError } = useBusinessData();
+  const { salesSummaryList, orderPaymentStatusMap } = useBusinessMetrics();
   const [modalOpen, setModalOpen] = useState(false);
 
   const [orderId, setOrderId] = useState('');
@@ -34,16 +36,17 @@ export const SalesPage: React.FC = () => {
   );
 
   const summary = useMemo(() => {
-    const totalIncome = db.orderPayments.reduce((s, p) => s + Number(p.amount), 0);
-    const totalOrderValue = db.orders.reduce((s, o) => s + Number(o.total_amount), 0);
+    const totalIncome = salesSummaryList.reduce((s, o) => s + Number(o.total_paid), 0);
+    const totalOrderValue = salesSummaryList.reduce((s, o) => s + Number(o.total_amount), 0);
+    const outstandingReceivables = salesSummaryList.reduce(
+      (s, o) => s + Number(o.remaining_payment),
+      0
+    );
+
     const paidPerOrder = new Map<string, number>();
-    db.orderPayments.forEach((p) => {
-      paidPerOrder.set(p.order_id, (paidPerOrder.get(p.order_id) ?? 0) + Number(p.amount));
+    orderPaymentStatusMap.forEach((row, id) => {
+      paidPerOrder.set(id, Number(row.total_paid));
     });
-    const outstandingReceivables = db.orders.reduce((s, o) => {
-      const paid = paidPerOrder.get(o.id) ?? 0;
-      return s + Math.max(0, Number(o.total_amount) - paid);
-    }, 0);
 
     const variantMap = new Map(db.productVariants.map((v) => [v.id, v]));
     const skuMap = new Map(db.productSkus.map((s) => [s.id, s]));
@@ -71,21 +74,28 @@ export const SalesPage: React.FC = () => {
       byVariant: Array.from(byVariant.entries()),
       paidPerOrder,
     };
-  }, [db.orderPayments, db.orders, db.orderItems, db.productSkus, db.productVariants]);
+  }, [salesSummaryList, orderPaymentStatusMap, db.orderItems, db.productSkus, db.productVariants]);
 
   const unpaidOrders = useMemo(() => {
     return db.orders.filter((o) => {
-      const paid = summary.paidPerOrder.get(o.id) ?? 0;
-      return paid < Number(o.total_amount);
+      const payView = orderPaymentStatusMap.get(o.id);
+      return Number(payView?.remaining_payment ?? Number(o.total_amount)) > 0;
     });
-  }, [db.orders, summary.paidPerOrder]);
+  }, [db.orders, orderPaymentStatusMap]);
 
   const handleOpenModal = () => {
     const firstOrder = unpaidOrders[0] ?? db.orders[0];
     setOrderId(firstOrder?.id ?? '');
     if (firstOrder) {
-      const paid = summary.paidPerOrder.get(firstOrder.id) ?? 0;
-      setAmount(Math.max(0, Number(firstOrder.total_amount) - paid));
+      const payView = orderPaymentStatusMap.get(firstOrder.id);
+      const rem = Number(
+        payView?.remaining_payment ??
+          Math.max(
+            0,
+            Number(firstOrder.total_amount) - (summary.paidPerOrder.get(firstOrder.id) ?? 0)
+          )
+      );
+      setAmount(Math.max(0, rem));
     }
     setCashAccountId(activeCashAccounts[0]?.id ?? '');
     setModalOpen(true);
@@ -101,8 +111,23 @@ export const SalesPage: React.FC = () => {
       notifyError('Pilih akun kas penerima pembayaran.');
       return;
     }
-    if (amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       notifyError('Nominal pembayaran harus lebih dari 0.');
+      return;
+    }
+    const payView = orderPaymentStatusMap.get(orderId);
+    const ord = orderMap.get(orderId);
+    const remaining = Number(
+      payView?.remaining_payment ??
+        Math.max(
+          0,
+          Number(ord?.total_amount ?? 0) - (summary.paidPerOrder.get(orderId) ?? 0)
+        )
+    );
+    if (ord && amount > remaining + 0.01) {
+      notifyError(
+        `Nominal pembayaran (${formatIDR(amount)}) melebihi sisa tagihan (${formatIDR(remaining)}).`
+      );
       return;
     }
 
@@ -274,8 +299,11 @@ export const SalesPage: React.FC = () => {
               value={orderId}
               onChange={(e) => {
                 setOrderId(e.target.value);
+                const payView = orderPaymentStatusMap.get(e.target.value);
                 const ord = orderMap.get(e.target.value);
-                if (ord) {
+                if (payView) {
+                  setAmount(Math.max(0, Number(payView.remaining_payment)));
+                } else if (ord) {
                   const paid = summary.paidPerOrder.get(ord.id) ?? 0;
                   setAmount(Math.max(0, Number(ord.total_amount) - paid));
                 }
@@ -283,8 +311,11 @@ export const SalesPage: React.FC = () => {
               className="w-full px-3 py-2 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-lg"
             >
               {db.orders.map((o) => {
-                const paid = summary.paidPerOrder.get(o.id) ?? 0;
-                const rem = Math.max(0, Number(o.total_amount) - paid);
+                const payView = orderPaymentStatusMap.get(o.id);
+                const paid = Number(payView?.total_paid ?? summary.paidPerOrder.get(o.id) ?? 0);
+                const rem = Number(
+                  payView?.remaining_payment ?? Math.max(0, Number(o.total_amount) - paid)
+                );
                 return (
                   <option key={o.id} value={o.id}>
                     {o.order_number} · Sisa: {formatIDR(rem)}
@@ -347,7 +378,8 @@ export const SalesPage: React.FC = () => {
               </label>
               <input
                 type="number"
-                min={1}
+                step="any"
+                min="0.01"
                 required
                 value={amount}
                 onChange={(e) => setAmount(Number(e.target.value))}

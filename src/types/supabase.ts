@@ -56,9 +56,12 @@ export interface ProductSkuRow {
   created_at: string;
 }
 
+export type MaterialType = 'solid' | 'liquid' | 'unit' | 'egg';
+
 export interface IngredientRow {
   id: string;
   name: string;
+  material_type?: MaterialType | string | null;
   unit: string;
   current_stock: number;
   average_unit_cost: number;
@@ -117,6 +120,10 @@ export interface IngredientPurchaseItemRow {
   quantity: number;
   unit_price: number;
   subtotal: number;
+  input_quantity?: number | null;
+  input_unit?: string | null;
+  input_unit_price?: number | null;
+  conversion_factor?: number | null;
 }
 
 export interface PurchasePaymentRow {
@@ -177,6 +184,9 @@ export interface ProductRecipeItemRow {
   recipe_id: string;
   ingredient_id: string;
   quantity: number;
+  input_quantity?: number | null;
+  input_unit?: string | null;
+  conversion_factor?: number | null;
   notes: string | null;
   created_at: string;
 }
@@ -187,6 +197,9 @@ export interface IngredientStockMovementRow {
   movement_type: string;
   quantity: number;
   unit_cost: number | null;
+  input_quantity?: number | null;
+  input_unit?: string | null;
+  conversion_factor?: number | null;
   reference_id: string | null;
   movement_date: string;
   notes: string | null;
@@ -250,6 +263,84 @@ export interface CashTransactionRow {
   created_at: string;
 }
 
+export interface CashAccountBalanceView {
+  cash_account_id: string;
+  account_name: string;
+  account_type: string;
+  is_active: boolean;
+  current_balance: number;
+}
+
+export interface FinishedGoodsStockView {
+  sku_id: string;
+  sku_code: string | null;
+  package_name: string;
+  weight_gram: number | null;
+  selling_price: number;
+  current_stock: number;
+}
+
+export interface IngredientStockView {
+  ingredient_id: string;
+  ingredient_name: string;
+  unit: string;
+  current_stock: number;
+  average_unit_cost: number;
+  stock_value: number;
+  is_active: boolean;
+}
+
+export interface OrderPaymentStatusView {
+  order_id: string;
+  order_number: string;
+  total_amount: number;
+  total_paid: number;
+  remaining_payment: number;
+  payment_status: string;
+}
+
+export interface ProductionBatchCostView {
+  batch_id: string;
+  batch_number: string;
+  sku_id: string;
+  planned_quantity: number;
+  actual_quantity: number | null;
+  status: string;
+  material_cost: number;
+  additional_cost: number;
+  total_production_cost: number;
+}
+
+export interface PurchasePaymentStatusView {
+  purchase_id: string;
+  supplier_name: string | null;
+  purchase_date: string;
+  total_amount: number;
+  total_paid: number;
+  remaining_payment: number;
+}
+
+export interface SalesSummaryView {
+  order_id: string;
+  order_number: string;
+  order_date: string;
+  status: string;
+  subtotal: number;
+  discount: number;
+  total_amount: number;
+  total_paid: number;
+  remaining_payment: number;
+}
+
+export interface SkuRecipeHppView {
+  recipe_id: string;
+  sku_id: string;
+  recipe_name: string;
+  sku_code: string | null;
+  package_name: string;
+  estimated_material_hpp: number;
+}
+
 export interface SupabaseBusinessState {
   businessProfiles: BusinessProfileRow[];
   customers: CustomerRow[];
@@ -274,4 +365,42 @@ export interface SupabaseBusinessState {
   capitalTransactions: CapitalTransactionRow[];
   cashAccounts: CashAccountRow[];
   cashTransactions: CashTransactionRow[];
+  cashAccountBalances: CashAccountBalanceView[];
+  finishedGoodsStock: FinishedGoodsStockView[];
+  ingredientStock: IngredientStockView[];
+  orderPaymentStatus: OrderPaymentStatusView[];
+  productionBatchCosts: ProductionBatchCostView[];
+  purchasePaymentStatus: PurchasePaymentStatusView[];
+  salesSummary: SalesSummaryView[];
+  skuRecipeHpp: SkuRecipeHppView[];
 }
+
+export type UUID = string;
+
+export type IngredientAdjustmentType = 'adjustment_in' | 'adjustment_out';
+
+export interface AdjustIngredientStockRpcArgs {
+  p_ingredient_id: UUID;
+  p_adjustment_type: IngredientAdjustmentType;
+  p_quantity: number;
+  p_unit: string;
+  p_notes: string | null;
+}
+
+export interface DeleteExpenseRpcArgs {
+  p_expense_id: UUID;
+}
+
+export type DeleteExpenseRpcReturn = UUID;
+
+export interface SupabaseRpcFunctions {
+  adjust_ingredient_stock: {
+    Args: AdjustIngredientStockRpcArgs;
+    Returns: unknown;
+  };
+  delete_expense: {
+    Args: DeleteExpenseRpcArgs;
+    Returns: DeleteExpenseRpcReturn;
+  };
+}
+

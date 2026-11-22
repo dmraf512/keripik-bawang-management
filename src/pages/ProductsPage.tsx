@@ -1,14 +1,31 @@
 import React, { useMemo, useState } from 'react';
 import { BookOpen, Package, Pencil, Plus, Trash2 } from 'lucide-react';
 import { useBusinessData } from '../context/DataContext';
+import { useBusinessMetrics } from '../hooks/useBusinessMetrics';
 import { supabaseService } from '../services/supabaseService';
-import { ProductSkuRow } from '../types/supabase';
-import { formatIDR } from '../utils/formatters';
+import { IngredientRow, ProductSkuRow } from '../types/supabase';
+import {
+  formatDecimalIDR,
+  formatIDR,
+  formatQuantity,
+} from '../utils/formatters';
+import {
+  convertToCanonicalQuantity,
+  getRecipeUnitOptions,
+  inferMaterialType,
+} from '../utils/units';
 import { Modal } from '../components/common/Modal';
 import { EmptyState } from '../components/common/EmptyState';
 
+interface RecipeItemDraft {
+  ingredient_id: string;
+  input_quantity: number;
+  input_unit: string;
+}
+
 export const ProductsPage: React.FC = () => {
   const { db, isMutating, executeMutation, notifyError } = useBusinessData();
+  const { skuRecipeHppMap } = useBusinessMetrics();
 
   // Add Variant Modal
   const [variantModalOpen, setVariantModalOpen] = useState(false);
@@ -33,9 +50,7 @@ export const ProductsPage: React.FC = () => {
   // Recipe Modal
   const [recipeSkuId, setRecipeSkuId] = useState<string | null>(null);
   const [recipeNotes, setRecipeNotes] = useState('');
-  const [recipeItems, setRecipeItems] = useState<
-    { ingredient_id: string; quantity: number }[]
-  >([]);
+  const [recipeItems, setRecipeItems] = useState<RecipeItemDraft[]>([]);
 
   const productMap = useMemo(
     () => new Map(db.products.map((p) => [p.id, p])),
@@ -45,6 +60,11 @@ export const ProductsPage: React.FC = () => {
   const variantMap = useMemo(
     () => new Map(db.productVariants.map((v) => [v.id, v])),
     [db.productVariants]
+  );
+
+  const ingredientMap = useMemo(
+    () => new Map(db.ingredients.map((i) => [i.id, i])),
+    [db.ingredients]
   );
 
   const activeRecipeTarget = useMemo(() => {
@@ -87,6 +107,16 @@ export const ProductsPage: React.FC = () => {
     return map;
   }, [db.productRecipes, db.productRecipeItems]);
 
+  const liveRecipeHppEstimate = useMemo(() => {
+    return recipeItems.reduce((sum, item) => {
+      const ing = ingredientMap.get(item.ingredient_id);
+      if (!ing) return sum;
+      const mt = inferMaterialType(ing.material_type, ing.unit, ing.name);
+      const conv = convertToCanonicalQuantity(item.input_quantity, item.input_unit, mt);
+      return sum + conv.canonicalQuantity * Number(ing.average_unit_cost);
+    }, 0);
+  }, [recipeItems, ingredientMap]);
+
   const handleOpenAddVariant = () => {
     setSelectedProductId(db.products[0]?.id ?? '');
     setVariantModalOpen(true);
@@ -99,20 +129,16 @@ export const ProductsPage: React.FC = () => {
       return;
     }
 
-    const res = await executeMutation(async () => {
-      let prodId = selectedProductId;
-      if (!prodId) {
-        const createdProd = await supabaseService.createProduct({
-          name: 'Keripik Bawang',
-          description: 'Keripik bawang buatan rumahan Made to Order',
-        });
-        prodId = createdProd.id;
-      }
-      return supabaseService.createProductVariant({
-        product_id: prodId,
-        variant_name: newVariantName.trim(),
-      });
-    }, `Varian "${newVariantName.trim()}" berhasil ditambahkan.`);
+    const res = await executeMutation(
+      () =>
+        supabaseService.createVariantWithOptionalProduct({
+          product_id: selectedProductId || undefined,
+          default_product_name: 'Keripik Bawang',
+          default_product_description: 'Keripik bawang buatan rumahan Made to Order',
+          variant_name: newVariantName.trim(),
+        }),
+      `Varian "${newVariantName.trim()}" berhasil ditambahkan.`
+    );
 
     if (res) {
       setVariantModalOpen(false);
@@ -125,8 +151,17 @@ export const ProductsPage: React.FC = () => {
       notifyError('Nama ukuran kemasan wajib diisi.');
       return;
     }
+    if (!Number.isFinite(sellingPrice) || sellingPrice < 0) {
+      notifyError('Harga jual SKU tidak valid.');
+      return;
+    }
 
     const parsedWeight = weightGram.trim() ? Number(weightGram) : null;
+    if (parsedWeight !== null && (!Number.isFinite(parsedWeight) || parsedWeight <= 0)) {
+      notifyError('Berat bersih (gram) harus berupa angka lebih dari 0.');
+      return;
+    }
+
     const res = await executeMutation(
       () =>
         supabaseService.createProductSku({
@@ -163,13 +198,22 @@ export const ProductsPage: React.FC = () => {
       notifyError('Nama ukuran kemasan wajib diisi.');
       return;
     }
+    if (!Number.isFinite(editSellingPrice) || editSellingPrice < 0) {
+      notifyError('Harga jual SKU tidak valid.');
+      return;
+    }
+    const parsedWeight = editWeightGram.trim() ? Number(editWeightGram) : null;
+    if (parsedWeight !== null && (!Number.isFinite(parsedWeight) || parsedWeight <= 0)) {
+      notifyError('Berat bersih (gram) harus berupa angka lebih dari 0.');
+      return;
+    }
 
     const res = await executeMutation(
       () =>
         supabaseService.updateProductSku(editingSku.id, {
           sku_code: editSkuCode.trim() || null,
           package_name: editPackageName.trim(),
-          weight_gram: editWeightGram.trim() ? Number(editWeightGram) : null,
+          weight_gram: parsedWeight,
           selling_price: Math.max(0, editSellingPrice),
           is_active: editIsActive,
         }),
@@ -181,39 +225,111 @@ export const ProductsPage: React.FC = () => {
     }
   };
 
+  const buildDefaultRecipeDraft = (ing: IngredientRow): RecipeItemDraft => {
+    const mt = inferMaterialType(ing.material_type, ing.unit, ing.name);
+    const options = getRecipeUnitOptions(mt);
+    return {
+      ingredient_id: ing.id,
+      input_quantity: 1,
+      input_unit: options[0]?.unit ?? ing.unit,
+    };
+  };
+
   const handleOpenRecipeModal = (skuId: string) => {
     const existing = db.productRecipes.find((r) => r.sku_id === skuId);
-    const items = existing
+    const items: RecipeItemDraft[] = existing
       ? db.productRecipeItems
           .filter((i) => i.recipe_id === existing.id)
-          .map((i) => ({ ingredient_id: i.ingredient_id, quantity: Number(i.quantity) }))
+          .map((i) => {
+            const ing = ingredientMap.get(i.ingredient_id);
+            const mt = inferMaterialType(ing?.material_type, ing?.unit, ing?.name);
+            const fallbackUnit = getRecipeUnitOptions(mt)[0]?.unit ?? ing?.unit ?? 'gram';
+            return {
+              ingredient_id: i.ingredient_id,
+              input_quantity: Number(i.input_quantity ?? i.quantity),
+              input_unit: i.input_unit || ing?.unit || fallbackUnit,
+            };
+          })
       : [];
     setRecipeNotes(existing?.notes ?? '');
     setRecipeItems(
       items.length > 0
         ? items
         : db.ingredients[0]
-        ? [{ ingredient_id: db.ingredients[0].id, quantity: 1 }]
+        ? [buildDefaultRecipeDraft(db.ingredients[0])]
         : []
     );
     setRecipeSkuId(skuId);
   };
 
+  const handleAddRecipeRow = () => {
+    const usedIds = new Set(recipeItems.map((i) => i.ingredient_id));
+    const nextAvailable = db.ingredients.find((ing) => !usedIds.has(ing.id));
+    if (!nextAvailable) {
+      notifyError('Seluruh bahan baku yang tersedia sudah dimasukkan ke resep ini.');
+      return;
+    }
+    setRecipeItems((prev) => [...prev, buildDefaultRecipeDraft(nextAvailable)]);
+  };
+
   const handleSaveRecipe = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!recipeSkuId || !activeRecipeTarget) return;
-    const validItems = recipeItems.filter((i) => i.ingredient_id && i.quantity > 0);
-
-    const res = await executeMutation(
-      () =>
-        supabaseService.saveProductRecipe({
-          sku_id: recipeSkuId,
-          recipe_name: activeRecipeTarget.recipeName,
-          notes: recipeNotes.trim() || null,
-          items: validItems,
-        }),
-      `Resep "${activeRecipeTarget.recipeName}" berhasil disimpan.`
+    if (recipeItems.length === 0) {
+      notifyError('Tambahkan minimal 1 bahan baku untuk menyimpan resep.');
+      return;
+    }
+    const hasInvalidQty = recipeItems.some(
+      (i) => !i.ingredient_id || !Number.isFinite(i.input_quantity) || i.input_quantity <= 0
     );
+    if (hasInvalidQty) {
+      notifyError('Setiap baris resep harus memiliki bahan dan takaran > 0 yang valid.');
+      return;
+    }
+    const validItems = recipeItems;
+
+    const seenIds = new Set<string>();
+    for (const item of validItems) {
+      if (seenIds.has(item.ingredient_id)) {
+        notifyError('Bahan baku yang sama tidak boleh dipilih dua kali dalam satu resep.');
+        return;
+      }
+      seenIds.add(item.ingredient_id);
+    }
+
+    const res = await executeMutation(async () => {
+      const convertedItems = await Promise.all(
+        validItems.map(async (item) => {
+          const ing = ingredientMap.get(item.ingredient_id);
+          const mt = inferMaterialType(ing?.material_type, ing?.unit, ing?.name);
+          const localConv = convertToCanonicalQuantity(
+            item.input_quantity,
+            item.input_unit,
+            mt
+          );
+          const rpcQuantity = await supabaseService.convertIngredientQuantity({
+            quantity: item.input_quantity,
+            input_unit: item.input_unit,
+            material_type: mt,
+          });
+          const canonicalQty = rpcQuantity > 0 ? rpcQuantity : localConv.canonicalQuantity;
+          return {
+            ingredient_id: item.ingredient_id,
+            quantity: canonicalQty,
+            input_quantity: item.input_quantity,
+            input_unit: item.input_unit,
+            conversion_factor: localConv.conversionFactor,
+          };
+        })
+      );
+
+      return supabaseService.saveProductRecipe({
+        sku_id: recipeSkuId,
+        recipe_name: activeRecipeTarget.recipeName,
+        notes: recipeNotes.trim() || null,
+        items: convertedItems,
+      });
+    }, `Resep "${activeRecipeTarget.recipeName}" berhasil disimpan.`);
 
     if (res !== null) {
       setRecipeSkuId(null);
@@ -221,16 +337,20 @@ export const ProductsPage: React.FC = () => {
   };
 
   const activeVariant = db.productVariants.find((v) => v.id === activeVariantId);
+  const usedIngredientIdsInRecipe = new Set(recipeItems.map((r) => r.ingredient_id));
+  const hasUnusedIngredient = db.ingredients.some(
+    (ing) => !usedIngredientIdsInRecipe.has(ing.id)
+  );
 
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h2 className="text-xl font-display font-semibold text-[#2B1B12]">
-            Manajemen Produk, Varian & SKU
+            Manajemen Produk, Varian &amp; SKU
           </h2>
           <p className="mt-0.5 text-sm text-[#6F574A]">
-            Kelola varian produk (Original, Pedas, Balado), ukuran kemasan (SKU), harga jual, dan resep bahan baku.
+            Kelola varian (Original, Pedas, Balado), ukuran kemasan (SKU), harga jual, resep per SKU (butir/gram/ml/pcs), dan estimasi HPP.
           </p>
         </div>
 
@@ -245,7 +365,7 @@ export const ProductsPage: React.FC = () => {
       </div>
 
       <div className="bg-[#FDF6E7]/70 border border-[#E5D9C8] rounded-xl px-4 py-3 text-xs text-[#6B4A0E]">
-        Ukuran kemasan dan harga jual disimpan fleksibel pada tabel <code>product_skus</code> dan tidak dikunci permanen.
+        Ukuran kemasan dan harga jual disimpan fleksibel per SKU di <code>product_skus</code>, dengan estimasi HPP bahan otomatis dari <code>v_sku_recipe_hpp</code>.
       </div>
 
       {db.productVariants.length === 0 ? (
@@ -291,7 +411,7 @@ export const ProductsPage: React.FC = () => {
                   <div className="py-4">
                     <div className="flex items-center justify-between gap-2 mb-2.5">
                       <span className="text-xs font-semibold text-[#2B1B12]">
-                        Daftar Ukuran & Harga (SKU)
+                        Daftar Ukuran &amp; Harga (SKU)
                       </span>
                       <span className="text-[11px] text-[#8A7163] tabular-nums">
                         {skus.length} SKU
@@ -308,6 +428,13 @@ export const ProductsPage: React.FC = () => {
                       <div className="divide-y divide-[#F5EFE6] border border-[#EFE6DA] rounded-lg overflow-hidden">
                         {skus.map((sku) => {
                           const recipeInfo = recipeBySku.get(sku.id);
+                          const hppView = skuRecipeHppMap.get(sku.id);
+                          const estHpp = hppView
+                            ? Number(hppView.estimated_material_hpp)
+                            : null;
+                          const estMargin =
+                            estHpp !== null ? Number(sku.selling_price) - estHpp : null;
+
                           return (
                             <div
                               key={sku.id}
@@ -319,12 +446,29 @@ export const ProductsPage: React.FC = () => {
                                   {sku.weight_gram ? ` (${sku.weight_gram}g)` : ''}
                                 </div>
                                 <div className="text-[11px] text-[#8A7163] tabular-nums">
-                                  Harga:{' '}
+                                  Jual:{' '}
                                   <strong className="text-[#362015]">
                                     {formatIDR(Number(sku.selling_price))}
                                   </strong>
                                   {sku.sku_code ? ` · ${sku.sku_code}` : ''}
                                 </div>
+                                {estHpp !== null && (
+                                  <div className="text-[11px] text-[#6F574A] tabular-nums mt-0.5">
+                                    Est. HPP Bahan:{' '}
+                                    <span className="font-medium text-[#2B1B12]">
+                                      {formatDecimalIDR(estHpp, 2)}
+                                    </span>
+                                    {estMargin !== null && (
+                                      <span
+                                        className={`ml-1.5 font-medium ${
+                                          estMargin >= 0 ? 'text-[#1E6B43]' : 'text-[#B4382A]'
+                                        }`}
+                                      >
+                                        (Margin: {formatIDR(estMargin)})
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                               <div className="flex items-center gap-1 shrink-0">
                                 <button
@@ -374,7 +518,7 @@ export const ProductsPage: React.FC = () => {
                   className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium border border-[#362015] text-[#362015] hover:bg-[#362015] hover:text-[#FDFBF7] transition-colors cursor-pointer"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Tambah Ukuran & Harga</span>
+                  <span>Tambah Ukuran &amp; Harga</span>
                 </button>
               </div>
             );
@@ -483,7 +627,8 @@ export const ProductsPage: React.FC = () => {
               </label>
               <input
                 type="number"
-                min={1}
+                step="any"
+                min="0.01"
                 value={weightGram}
                 onChange={(e) => setWeightGram(e.target.value)}
                 placeholder="250"
@@ -496,6 +641,7 @@ export const ProductsPage: React.FC = () => {
               </label>
               <input
                 type="number"
+                step="any"
                 min={0}
                 required
                 value={sellingPrice}
@@ -529,7 +675,7 @@ export const ProductsPage: React.FC = () => {
         open={Boolean(recipeSkuId)}
         onClose={() => setRecipeSkuId(null)}
         title="Resep Bahan Baku per Kemasan"
-        subtitle="Digunakan otomatis oleh register_production saat membuat batch."
+        subtitle="Telur mendukung input butir (1 butir = 60 gram) atau gram; otomatis dikonversi ke satuan kanonis."
       >
         {db.ingredients.length === 0 ? (
           <p className="text-xs text-[#6F574A]">
@@ -538,71 +684,158 @@ export const ProductsPage: React.FC = () => {
         ) : (
           <form onSubmit={(e) => void handleSaveRecipe(e)} className="space-y-4">
             {activeRecipeTarget && (
-              <div className="p-3 rounded-lg bg-[#FAF6F0] border border-[#EFE6DA] text-xs">
-                <div className="text-[11px] text-[#7A6154]">
-                  Nama Resep (Otomatis dari Produk, Varian &amp; SKU)
+              <div className="p-3 rounded-lg bg-[#FAF6F0] border border-[#EFE6DA] text-xs flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] text-[#7A6154]">
+                    Nama Resep (Otomatis dari Produk, Varian &amp; SKU)
+                  </div>
+                  <div className="mt-0.5 font-semibold text-[#2B1B12]">
+                    {activeRecipeTarget.recipeName}
+                  </div>
                 </div>
-                <div className="mt-0.5 font-semibold text-[#2B1B12]">
-                  {activeRecipeTarget.recipeName}
+                <div className="text-right tabular-nums shrink-0">
+                  <div className="text-[11px] text-[#7A6154]">Harga Jual SKU</div>
+                  <div className="font-semibold text-[#362015]">
+                    {formatIDR(Number(activeRecipeTarget.sku.selling_price))}
+                  </div>
                 </div>
               </div>
             )}
 
             <div className="space-y-2.5">
-              {recipeItems.map((item, idx) => (
-                <div key={idx} className="flex items-center gap-2">
-                  <select
-                    value={item.ingredient_id}
-                    onChange={(e) => {
-                      const next = [...recipeItems];
-                      next[idx].ingredient_id = e.target.value;
-                      setRecipeItems(next);
-                    }}
-                    className="flex-1 px-3 py-2 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-lg"
+              {recipeItems.map((item, idx) => {
+                const ing = ingredientMap.get(item.ingredient_id);
+                const mt = inferMaterialType(ing?.material_type, ing?.unit, ing?.name);
+                const unitOptions = getRecipeUnitOptions(mt);
+                const conv = convertToCanonicalQuantity(
+                  item.input_quantity,
+                  item.input_unit,
+                  mt
+                );
+                const lineCost =
+                  conv.canonicalQuantity * Number(ing?.average_unit_cost ?? 0);
+
+                return (
+                  <div
+                    key={idx}
+                    className="p-2.5 rounded-lg bg-[#FAF6F0] border border-[#E5D9C8] space-y-1.5"
                   >
-                    {db.ingredients.map((ing) => (
-                      <option key={ing.id} value={ing.id}>
-                        {ing.name} ({ing.unit})
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0.01"
-                    required
-                    value={item.quantity}
-                    onChange={(e) => {
-                      const next = [...recipeItems];
-                      next[idx].quantity = Number(e.target.value);
-                      setRecipeItems(next);
-                    }}
-                    className="w-24 px-3 py-2 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-lg tabular-nums"
-                  />
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setRecipeItems((prev) => prev.filter((_, i) => i !== idx))
-                    }
-                    className="p-2 text-[#8A7163] hover:text-[#B4382A] cursor-pointer"
-                    aria-label="Hapus baris resep"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
-              <button
-                type="button"
-                onClick={() =>
-                  setRecipeItems((prev) => [
-                    ...prev,
-                    { ingredient_id: db.ingredients[0].id, quantity: 1 },
-                  ])
-                }
-                className="text-xs font-medium text-[#5E3A28] hover:text-[#2B1B12] underline cursor-pointer"
-              >
-                + Tambah Bahan
-              </button>
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                      <select
+                        value={item.ingredient_id}
+                        onChange={(e) => {
+                          const nextIng = ingredientMap.get(e.target.value);
+                          const nextMt = inferMaterialType(
+                            nextIng?.material_type,
+                            nextIng?.unit,
+                            nextIng?.name
+                          );
+                          const nextUnits = getRecipeUnitOptions(nextMt);
+                          setRecipeItems((prev) =>
+                            prev.map((row, i) =>
+                              i === idx
+                                ? {
+                                    ...row,
+                                    ingredient_id: e.target.value,
+                                    input_unit:
+                                      nextUnits[0]?.unit ?? nextIng?.unit ?? 'gram',
+                                  }
+                                : row
+                            )
+                          );
+                        }}
+                        className="flex-1 px-2.5 py-2 text-xs bg-white border border-[#E5D9C8] rounded-lg"
+                      >
+                        {db.ingredients.map((ingOpt) => {
+                          const alreadyUsedElsewhere =
+                            ingOpt.id !== item.ingredient_id &&
+                            usedIngredientIdsInRecipe.has(ingOpt.id);
+                          return (
+                            <option
+                              key={ingOpt.id}
+                              value={ingOpt.id}
+                              disabled={alreadyUsedElsewhere}
+                            >
+                              {ingOpt.name} ({ingOpt.unit})
+                              {alreadyUsedElsewhere ? ' — sudah dipilih' : ''}
+                            </option>
+                          );
+                        })}
+                      </select>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          step="any"
+                          min="0.0001"
+                          required
+                          value={item.input_quantity}
+                          onChange={(e) =>
+                            setRecipeItems((prev) =>
+                              prev.map((row, i) =>
+                                i === idx
+                                  ? { ...row, input_quantity: Number(e.target.value) }
+                                  : row
+                              )
+                            )
+                          }
+                          className="w-24 px-2.5 py-2 text-xs bg-white border border-[#E5D9C8] rounded-lg tabular-nums"
+                        />
+                        <select
+                          value={item.input_unit}
+                          onChange={(e) =>
+                            setRecipeItems((prev) =>
+                              prev.map((row, i) =>
+                                i === idx ? { ...row, input_unit: e.target.value } : row
+                              )
+                            )
+                          }
+                          className="w-28 px-2 py-2 text-xs bg-white border border-[#E5D9C8] rounded-lg"
+                        >
+                          {unitOptions.map((opt) => (
+                            <option key={opt.unit} value={opt.unit}>
+                              {opt.unit}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setRecipeItems((prev) => prev.filter((_, i) => i !== idx))
+                          }
+                          className="p-2 text-[#8A7163] hover:text-[#B4382A] cursor-pointer"
+                          aria-label="Hapus baris resep"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between text-[11px] text-[#6F574A] tabular-nums">
+                      <span>
+                        Konversi stok:{' '}
+                        <strong className="text-[#2B1B12]">
+                          {formatQuantity(conv.canonicalQuantity, conv.canonicalUnit)}
+                        </strong>
+                      </span>
+                      <span>Est. biaya: {formatDecimalIDR(lineCost, 2)}</span>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {hasUnusedIngredient ? (
+                <button
+                  type="button"
+                  onClick={handleAddRecipeRow}
+                  className="text-xs font-medium text-[#5E3A28] hover:text-[#2B1B12] underline cursor-pointer"
+                >
+                  + Tambah Bahan
+                </button>
+              ) : (
+                <p className="text-[11px] text-[#8A7163]">
+                  Seluruh bahan baku telah dipilih dalam resep ini.
+                </p>
+              )}
             </div>
 
             <div>
@@ -616,6 +849,13 @@ export const ProductsPage: React.FC = () => {
                 placeholder="Takaran per 1 kemasan"
                 className="w-full px-3 py-2 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-lg"
               />
+            </div>
+
+            <div className="p-3 rounded-lg bg-[#FDF6E7]/70 border border-[#E5D9C8] flex items-center justify-between text-xs tabular-nums">
+              <span className="text-[#6B4A0E]">Estimasi HPP Bahan / Kemasan:</span>
+              <span className="font-semibold text-[#2B1B12]">
+                {formatDecimalIDR(liveRecipeHppEstimate, 2)}
+              </span>
             </div>
 
             <div className="pt-3 border-t border-[#EFE6DA] flex justify-end gap-2">
@@ -678,7 +918,8 @@ export const ProductsPage: React.FC = () => {
               </label>
               <input
                 type="number"
-                min={1}
+                step="any"
+                min="0.01"
                 value={editWeightGram}
                 onChange={(e) => setEditWeightGram(e.target.value)}
                 className="w-full px-3 py-2 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-lg tabular-nums"
@@ -690,6 +931,7 @@ export const ProductsPage: React.FC = () => {
               </label>
               <input
                 type="number"
+                step="any"
                 min={0}
                 required
                 value={editSellingPrice}

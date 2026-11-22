@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { ArrowRight, Landmark, Plus, Wallet } from 'lucide-react';
 import { useBusinessData } from '../context/DataContext';
+import { useBusinessMetrics } from '../hooks/useBusinessMetrics';
 import { supabaseService } from '../services/supabaseService';
 import { PageId } from '../types/supabase';
 import {
@@ -22,6 +23,7 @@ type FinanceTab = 'modal' | 'akun-kas' | 'pemasukan' | 'pengeluaran' | 'arus-kas
 
 export const FinancePage: React.FC<FinancePageProps> = ({ onNavigate }) => {
   const { db, isMutating, executeMutation, notifyError } = useBusinessData();
+  const { cashAccountBalanceMap, totalCashBalance } = useBusinessMetrics();
   const [activeTab, setActiveTab] = useState<FinanceTab>('modal');
 
   // Capital Modal
@@ -63,34 +65,18 @@ export const FinancePage: React.FC<FinancePageProps> = ({ onNavigate }) => {
       db.expenses.reduce((s, e) => s + Number(e.amount), 0) +
       db.purchasePayments.reduce((s, p) => s + Number(p.amount), 0);
 
-    const saldoPerAccount = new Map<string, number>();
-    db.cashTransactions.forEach((tx) => {
-      const isOut = isCashOutflowType(tx.transaction_type);
-      const cur = saldoPerAccount.get(tx.cash_account_id) ?? 0;
-      saldoPerAccount.set(
-        tx.cash_account_id,
-        isOut ? cur - Number(tx.amount) : cur + Number(tx.amount)
-      );
-    });
-
-    const totalSaldoKas =
-      db.cashTransactions.length > 0
-        ? Array.from(saldoPerAccount.values()).reduce((a, b) => a + b, 0)
-        : totalModal + totalPemasukan - totalPengeluaran;
-
     return {
       totalModal,
       totalPemasukan,
       totalPengeluaran,
-      totalSaldoKas,
-      saldoPerAccount,
+      totalSaldoKas: totalCashBalance,
     };
   }, [
     db.capitalTransactions,
     db.orderPayments,
     db.expenses,
     db.purchasePayments,
-    db.cashTransactions,
+    totalCashBalance,
   ]);
 
   const handleOpenCapitalModal = () => {
@@ -101,8 +87,8 @@ export const FinancePage: React.FC<FinancePageProps> = ({ onNavigate }) => {
 
   const handleAddCapital = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!capDesc.trim() || capAmount <= 0) {
-      notifyError('Keterangan dan nominal modal wajib diisi.');
+    if (!capDesc.trim() || !Number.isFinite(capAmount) || capAmount <= 0) {
+      notifyError('Keterangan dan nominal modal yang valid wajib diisi.');
       return;
     }
     const cashId = capCashAccountId || activeCashAccounts[0]?.id;
@@ -306,7 +292,9 @@ export const FinancePage: React.FC<FinancePageProps> = ({ onNavigate }) => {
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 p-5">
               {db.cashAccounts.map((acc) => {
-                const bal = metrics.saldoPerAccount.get(acc.id) ?? 0;
+                const bal = Number(
+                  cashAccountBalanceMap.get(acc.id)?.current_balance ?? 0
+                );
                 return (
                   <div
                     key={acc.id}
@@ -564,7 +552,8 @@ export const FinancePage: React.FC<FinancePageProps> = ({ onNavigate }) => {
               </label>
               <input
                 type="number"
-                min={1}
+                step="any"
+                min="0.01"
                 required
                 value={capAmount}
                 onChange={(e) => setCapAmount(Number(e.target.value))}

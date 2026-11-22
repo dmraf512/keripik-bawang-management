@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ClipboardList, CreditCard, Plus, Search, Trash2 } from 'lucide-react';
 import { useBusinessData } from '../context/DataContext';
+import { useBusinessMetrics } from '../hooks/useBusinessMetrics';
 import { supabaseService } from '../services/supabaseService';
 import { PageId } from '../types/supabase';
 import { addDaysISO, formatDateID, formatIDR, getTodayISO } from '../utils/formatters';
@@ -41,6 +42,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
   onCloseExternalModal,
 }) => {
   const { db, isMutating, executeMutation, notifyError } = useBusinessData();
+  const { orderPaymentStatusMap } = useBusinessMetrics();
   const [statusFilter, setStatusFilter] = useState<string>('Semua');
   const [searchQuery, setSearchQuery] = useState('');
   const [localModalOpen, setLocalModalOpen] = useState(false);
@@ -159,8 +161,13 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
     }
   };
 
-  const computedSubtotal = Math.max(0, quantity) * Math.max(0, unitPrice);
-  const computedTotal = Math.max(0, computedSubtotal - Math.max(0, discount));
+  const computedSubtotal =
+    (Number.isFinite(quantity) ? Math.max(0, quantity) : 0) *
+    (Number.isFinite(unitPrice) ? Math.max(0, unitPrice) : 0);
+  const computedTotal = Math.max(
+    0,
+    computedSubtotal - (Number.isFinite(discount) ? Math.max(0, discount) : 0)
+  );
 
   const handleSubmitOrder = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -169,8 +176,24 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
       notifyError('Pilih ukuran kemasan (SKU) produk terlebih dahulu.');
       return;
     }
-    if (quantity < 1) {
+    if (!Number.isFinite(quantity) || quantity < 1) {
       notifyError('Jumlah pesanan minimal 1.');
+      return;
+    }
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) {
+      notifyError('Harga satuan tidak valid.');
+      return;
+    }
+    if (!Number.isFinite(discount) || discount < 0) {
+      notifyError('Diskon tidak boleh bernilai negatif.');
+      return;
+    }
+    if (!Number.isFinite(initialPaidAmount) || initialPaidAmount < 0) {
+      notifyError('Nominal pembayaran awal tidak valid.');
+      return;
+    }
+    if (initialPaidAmount > computedTotal + 0.01) {
+      notifyError('Pembayaran awal tidak boleh melebihi total tagihan pesanan.');
       return;
     }
     if (customerMode === 'existing' && !selectedCustomerId) {
@@ -186,49 +209,69 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
       return;
     }
 
-    const orderNumber = `MTO-${new Date()
-      .toISOString()
-      .slice(2, 10)
-      .replace(/-/g, '')}-${String(db.orders.length + 1).padStart(3, '0')}`;
+    const prefix = `MTO-${getTodayISO().slice(2).replace(/-/g, '')}-`;
+    const maxSuffix = db.orders.reduce((max, o) => {
+      if (!o.order_number.startsWith(prefix)) return max;
+      const suffixNum = Number.parseInt(o.order_number.slice(prefix.length), 10);
+      return Number.isFinite(suffixNum) && suffixNum > max ? suffixNum : max;
+    }, 0);
+    const orderNumber = `${prefix}${String(maxSuffix + 1).padStart(3, '0')}`;
 
     const result = await executeMutation(async () => {
       let customerId = selectedCustomerId || null;
+      let createdCustomerId: string | null = null;
       if (customerMode === 'new') {
         const createdCustomer = await supabaseService.createCustomer({
           name: newCustomerName.trim(),
           phone: newCustomerPhone.trim() || null,
         });
         customerId = createdCustomer.id;
+        createdCustomerId = createdCustomer.id;
       }
 
       const cashAccId = initialCashAccountId || activeCashAccounts[0]?.id || '';
 
-      return supabaseService.createOrder({
-        order_number: orderNumber,
-        customer_id: customerId,
-        order_date: orderDate,
-        due_date: dueDate || null,
-        status: 'Menunggu',
-        discount: Math.max(0, discount),
-        notes: notes.trim() || null,
-        items: [
-          {
-            sku_id: selectedSkuId,
-            quantity: Math.max(1, quantity),
-            unit_price: Math.max(0, unitPrice),
-          },
-        ],
-        initial_payment:
-          initialPaidAmount > 0 && cashAccId
-            ? {
-                amount: initialPaidAmount,
-                cash_account_id: cashAccId,
-                payment_method: initialPayMethod,
-                payment_date: orderDate,
-                notes: 'Pembayaran awal saat pencatatan pesanan',
-              }
-            : undefined,
-      });
+      try {
+        return await supabaseService.createOrder({
+          order_number: orderNumber,
+          customer_id: customerId,
+          order_date: orderDate,
+          due_date: dueDate || null,
+          status: 'Menunggu',
+          discount: Math.max(0, discount),
+          notes: notes.trim() || null,
+          items: [
+            {
+              sku_id: selectedSkuId,
+              quantity: Math.max(1, quantity),
+              unit_price: Math.max(0, unitPrice),
+            },
+          ],
+          initial_payment:
+            initialPaidAmount > 0 && cashAccId
+              ? {
+                  amount: initialPaidAmount,
+                  cash_account_id: cashAccId,
+                  payment_method: initialPayMethod,
+                  payment_date: orderDate,
+                  notes: 'Pembayaran awal saat pencatatan pesanan',
+                }
+              : undefined,
+        });
+      } catch (err) {
+        const orderErrMsg = err instanceof Error ? err.message : String(err);
+        if (createdCustomerId) {
+          try {
+            await supabaseService.deleteCustomer(createdCustomerId);
+          } catch (rbErr) {
+            const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
+            throw new Error(
+              `${orderErrMsg}. PERINGATAN ROLLBACK: Pelanggan baru gagal dihapus otomatis (${rbMsg}).`
+            );
+          }
+        }
+        throw err;
+      }
     }, `Pesanan ${orderNumber} berhasil disimpan ke Supabase.`);
 
     if (result) {
@@ -253,8 +296,19 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
   const handleSubmitPayment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!paymentOrderId) return;
-    if (payAmount <= 0) {
+    if (!Number.isFinite(payAmount) || payAmount <= 0) {
       notifyError('Nominal pembayaran harus lebih besar dari 0.');
+      return;
+    }
+    const payView = orderPaymentStatusMap.get(paymentOrderId);
+    const remaining = Number(
+      payView?.remaining_payment ??
+        Math.max(0, (payView?.total_amount ?? 0) - (paidByOrderMap.get(paymentOrderId) ?? 0))
+    );
+    if (payView && payAmount > remaining + 0.01) {
+      notifyError(
+        `Nominal pembayaran (${formatIDR(payAmount)}) melebihi sisa tagihan (${formatIDR(remaining)}).`
+      );
       return;
     }
     const cashId = payCashAccountId || activeCashAccounts[0]?.id;
@@ -401,15 +455,19 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                 {filteredOrders.map((order) => {
                   const items = itemsByOrderMap.get(order.id) ?? [];
                   const totalQty = items.reduce((s, i) => s + Number(i.quantity), 0);
-                  const paid = paidByOrderMap.get(order.id) ?? 0;
-                  const totalAmt = Number(order.total_amount);
-                  const remaining = Math.max(0, totalAmt - paid);
+                  const payView = orderPaymentStatusMap.get(order.id);
+                  const totalAmt = Number(payView?.total_amount ?? order.total_amount);
+                  const paid = Number(payView?.total_paid ?? paidByOrderMap.get(order.id) ?? 0);
+                  const remaining = Number(
+                    payView?.remaining_payment ?? Math.max(0, totalAmt - paid)
+                  );
                   const payStatus =
-                    paid >= totalAmt && totalAmt > 0
+                    payView?.payment_status ??
+                    (paid >= totalAmt && totalAmt > 0
                       ? 'Lunas'
                       : paid > 0
                       ? 'DP / Sebagian'
-                      : 'Belum Bayar';
+                      : 'Belum Bayar');
                   const customerName = order.customer_id
                     ? customerMap.get(order.customer_id)?.name ?? 'Pelanggan'
                     : 'Pelanggan Umum';
@@ -670,6 +728,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                 </label>
                 <input
                   type="number"
+                  step="any"
                   min={0}
                   required
                   value={unitPrice}
@@ -683,6 +742,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                 </label>
                 <input
                   type="number"
+                  step="any"
                   min={0}
                   value={discount}
                   onChange={(e) => setDiscount(Number(e.target.value))}
@@ -704,6 +764,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                     </label>
                     <input
                       type="number"
+                      step="any"
                       min={0}
                       max={computedTotal}
                       value={initialPaidAmount}
@@ -839,7 +900,8 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                 </label>
                 <input
                   type="number"
-                  min={1}
+                  step="any"
+                  min="0.01"
                   required
                   value={payAmount}
                   onChange={(e) => setPayAmount(Number(e.target.value))}

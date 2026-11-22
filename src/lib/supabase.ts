@@ -1,5 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
+export const ADMIN_USER_ID = '46d09929-1a3e-4598-81b2-c27834abf126';
+
 export interface SupabaseConfigStatus {
   isConfigured: boolean;
   url: string | null;
@@ -7,7 +9,9 @@ export interface SupabaseConfigStatus {
 }
 
 const rawSupabaseUrl = import.meta.env.VITE_SUPABASE_URL?.trim();
-const rawSupabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim();
+const rawSupabaseKey =
+  import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() ||
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim();
 
 function validateSupabaseConfig(): SupabaseConfigStatus {
   const missing: string[] = [];
@@ -16,7 +20,7 @@ function validateSupabaseConfig(): SupabaseConfigStatus {
     missing.push('VITE_SUPABASE_URL');
   }
   if (!rawSupabaseKey) {
-    missing.push('VITE_SUPABASE_PUBLISHABLE_KEY');
+    missing.push('VITE_SUPABASE_ANON_KEY');
   }
 
   if (missing.length > 0) {
@@ -116,7 +120,7 @@ export function mapSupabaseAuthError(error: unknown): string {
   }
 
   if (lower.includes('invalid api key') || lower.includes('apikey')) {
-    return 'Kunci API Supabase tidak valid. Periksa VITE_SUPABASE_PUBLISHABLE_KEY pada .env.local.';
+    return 'Kunci API Supabase tidak valid. Periksa VITE_SUPABASE_ANON_KEY pada .env.local.';
   }
 
   return message || 'Gagal memproses autentikasi. Silakan coba kembali.';

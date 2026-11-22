@@ -1,8 +1,16 @@
 import React, { useMemo, useState } from 'react';
 import { CheckCircle2, ChefHat, Plus, Trash2 } from 'lucide-react';
 import { useBusinessData } from '../context/DataContext';
+import { useBusinessMetrics } from '../hooks/useBusinessMetrics';
 import { supabaseService } from '../services/supabaseService';
-import { formatDateID, formatIDR, getTodayISO } from '../utils/formatters';
+import {
+  formatDateID,
+  formatDecimalIDR,
+  formatIDR,
+  formatQuantity,
+  getTodayISO,
+} from '../utils/formatters';
+import { roundPrecision } from '../utils/units';
 import { EmptyState } from '../components/common/EmptyState';
 import {
   BatchStatusLabel,
@@ -14,6 +22,7 @@ type ProductionTab = 'batches' | 'usage' | 'costs' | 'inventory';
 
 export const ProductionPage: React.FC = () => {
   const { db, isMutating, executeMutation, notifyError } = useBusinessData();
+  const { productionBatchCostMap, finishedGoodsStockList } = useBusinessMetrics();
   const [activeTab, setActiveTab] = useState<ProductionTab>('batches');
   const [batchModalOpen, setBatchModalOpen] = useState(false);
 
@@ -63,42 +72,20 @@ export const ProductionPage: React.FC = () => {
 
   const batchCostsSummary = useMemo(() => {
     return db.productionBatches.map((b) => {
-      const matCost = db.productionMaterials
-        .filter((m) => m.batch_id === b.id)
-        .reduce((s, m) => s + Number(m.total_cost), 0);
-      const otherCost = db.productionCostItems
-        .filter((c) => c.batch_id === b.id)
-        .reduce((s, c) => s + Number(c.amount), 0);
-      const total = matCost + otherCost;
+      const viewRow = productionBatchCostMap.get(b.id);
+      const matCost = Number(viewRow?.material_cost ?? 0);
+      const otherCost = Number(viewRow?.additional_cost ?? 0);
+      const total = Number(viewRow?.total_production_cost ?? matCost + otherCost);
       const qty = Number(b.actual_quantity ?? b.planned_quantity) || 1;
       return {
         batch: b,
         matCost,
         otherCost,
         total,
-        perUnit: Math.round(total / qty),
+        perUnit: roundPrecision(total / qty, 4),
       };
     });
-  }, [db.productionBatches, db.productionMaterials, db.productionCostItems]);
-
-  const finishedInventory = useMemo(() => {
-    const stockBySku = new Map<string, number>();
-    db.finishedGoodsMovements.forEach((mov) => {
-      const t = mov.movement_type.toLowerCase();
-      const isOut =
-        t.includes('out') || t.includes('keluar') || t.includes('sale') || t.includes('order');
-      const cur = stockBySku.get(mov.sku_id) ?? 0;
-      stockBySku.set(
-        mov.sku_id,
-        isOut ? cur - Number(mov.quantity) : cur + Number(mov.quantity)
-      );
-    });
-    return Array.from(stockBySku.entries()).map(([id, qty]) => ({
-      skuId: id,
-      label: skuLabelMap.get(id) ?? 'SKU Produk',
-      qty,
-    }));
-  }, [db.finishedGoodsMovements, skuLabelMap]);
+  }, [db.productionBatches, productionBatchCostMap]);
 
   const handleOpenCreateBatch = () => {
     setSkuId(activeSkus[0]?.id ?? '');
@@ -115,15 +102,18 @@ export const ProductionPage: React.FC = () => {
       notifyError('Pilih varian & kemasan produk (SKU) terlebih dahulu.');
       return;
     }
-    if (plannedQty < 1) {
+    if (!Number.isFinite(plannedQty) || plannedQty < 1) {
       notifyError('Target jumlah produksi minimal 1.');
       return;
     }
 
-    const batchNumber = `BATCH-${new Date()
-      .toISOString()
-      .slice(2, 10)
-      .replace(/-/g, '')}-${String(db.productionBatches.length + 1).padStart(2, '0')}`;
+    const prefix = `BATCH-${getTodayISO().slice(2).replace(/-/g, '')}-`;
+    const maxSuffix = db.productionBatches.reduce((max, b) => {
+      if (!b.batch_number.startsWith(prefix)) return max;
+      const suffixNum = Number.parseInt(b.batch_number.slice(prefix.length), 10);
+      return Number.isFinite(suffixNum) && suffixNum > max ? suffixNum : max;
+    }, 0);
+    const batchNumber = `${prefix}${String(maxSuffix + 1).padStart(2, '0')}`;
 
     const res = await executeMutation(
       () =>
@@ -172,8 +162,16 @@ export const ProductionPage: React.FC = () => {
   const handleCompleteBatch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!completeBatchId) return;
-    if (actualQty < 0) {
+    if (!Number.isFinite(actualQty) || actualQty < 0) {
       notifyError('Jumlah hasil aktual tidak boleh negatif.');
+      return;
+    }
+
+    const invalidCost = costItemsDraft.some(
+      (item) => !Number.isFinite(item.amount) || item.amount < 0
+    );
+    if (invalidCost) {
+      notifyError('Nominal biaya tambahan produksi tidak valid.');
       return;
     }
 
@@ -360,13 +358,13 @@ export const ProductionPage: React.FC = () => {
                           {ing?.name ?? 'Bahan'}
                         </td>
                         <td className="py-3 px-4 text-right tabular-nums">
-                          {m.quantity_used} {ing?.unit ?? ''}
+                          {formatQuantity(Number(m.quantity_used), ing?.unit)}
                         </td>
                         <td className="py-3 px-4 text-right tabular-nums text-[#5E3A28]">
-                          {formatIDR(Number(m.unit_cost))}
+                          {formatDecimalIDR(Number(m.unit_cost))}
                         </td>
                         <td className="py-3 px-4 text-right tabular-nums font-medium text-[#2B1B12]">
-                          {formatIDR(Number(m.total_cost))}
+                          {formatDecimalIDR(Number(m.total_cost), 2)}
                         </td>
                       </tr>
                     );
@@ -385,7 +383,7 @@ export const ProductionPage: React.FC = () => {
             Rekap Biaya Produksi per Batch
           </h3>
           <p className="text-xs text-[#7A6154] mb-4">
-            Akumulasi biaya bahan baku dan biaya tambahan produksi (production_cost_items).
+            Akumulasi biaya bahan baku dan biaya tambahan produksi dari <code>v_production_batch_costs</code>.
           </p>
           {batchCostsSummary.length === 0 ? (
             <p className="text-xs text-[#8A7163] py-6 text-center">
@@ -414,16 +412,16 @@ export const ProductionPage: React.FC = () => {
                         {skuLabelMap.get(batch.sku_id) ?? '-'}
                       </td>
                       <td className="py-2.5 px-3 text-right tabular-nums">
-                        {formatIDR(matCost)}
+                        {formatDecimalIDR(matCost, 2)}
                       </td>
                       <td className="py-2.5 px-3 text-right tabular-nums">
                         {formatIDR(otherCost)}
                       </td>
                       <td className="py-2.5 px-3 text-right tabular-nums font-semibold">
-                        {formatIDR(total)}
+                        {formatDecimalIDR(total, 2)}
                       </td>
                       <td className="py-2.5 px-3 text-right tabular-nums text-[#5E3A28]">
-                        {formatIDR(perUnit)}
+                        {formatDecimalIDR(perUnit, 2)}
                       </td>
                     </tr>
                   ))}
@@ -438,27 +436,35 @@ export const ProductionPage: React.FC = () => {
       {activeTab === 'inventory' && (
         <div className="bg-white border border-[#E5D9C8] rounded-xl p-5 shadow-2xs">
           <h3 className="text-sm font-display font-semibold text-[#2B1B12] mb-1">
-            Stok Produk Jadi (Finished Goods Movements)
+            Stok Produk Jadi (v_finished_goods_stock)
           </h3>
           <p className="text-xs text-[#7A6154] mb-4">
-            Dihitung dari pergerakan barang jadi pada tabel finished_goods_movements.
+            Ringkasan stok produk jadi per SKU dari view <code>v_finished_goods_stock</code>.
           </p>
-          {finishedInventory.length === 0 ? (
+          {finishedGoodsStockList.length === 0 ? (
             <p className="text-xs text-[#8A7163] py-6 text-center">
-              Belum ada pergerakan stok produk jadi tercatat.
+              Belum ada data stok produk jadi tercatat.
             </p>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              {finishedInventory.map((item) => (
+              {finishedGoodsStockList.map((item) => (
                 <div
-                  key={item.skuId}
+                  key={item.sku_id}
                   className="p-4 rounded-lg bg-[#FAF6F0] border border-[#EFE6DA]"
                 >
                   <div className="text-xs font-medium text-[#2B1B12]">
-                    {item.label}
+                    {skuLabelMap.get(item.sku_id) ?? item.package_name}
                   </div>
-                  <div className="mt-2 text-lg font-semibold text-[#1E6B43] tabular-nums">
-                    {item.qty} kemasan
+                  <div className="mt-0.5 text-[11px] text-[#7A6154] tabular-nums">
+                    Harga Jual: {formatIDR(Number(item.selling_price))}
+                    {item.sku_code ? ` · ${item.sku_code}` : ''}
+                  </div>
+                  <div
+                    className={`mt-2 text-lg font-semibold tabular-nums ${
+                      Number(item.current_stock) > 0 ? 'text-[#1E6B43]' : 'text-[#8A7163]'
+                    }`}
+                  >
+                    {formatQuantity(Number(item.current_stock), 'kemasan')}
                   </div>
                 </div>
               ))}
@@ -583,73 +589,75 @@ export const ProductionPage: React.FC = () => {
             <label className="block text-xs font-medium text-[#2B1B12] mb-1">
               Jumlah Hasil Aktual (Kemasan)
             </label>
-            <input
-              type="number"
-              min={0}
-              required
-              value={actualQty}
-              onChange={(e) => setActualQty(Number(e.target.value))}
-              className="w-full px-3 py-2 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-lg tabular-nums"
-            />
-          </div>
-
-          <div className="p-3.5 rounded-lg bg-[#FAF6F0] border border-[#EFE6DA] space-y-3">
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-xs font-medium text-[#2B1B12]">
-                Biaya Tambahan Produksi (Opsional)
-              </div>
-              <button
-                type="button"
-                onClick={handleAddCostItemRow}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium bg-white border border-[#D9CBB8] text-[#362015] hover:bg-[#EFE6DA] cursor-pointer"
-              >
-                <Plus className="w-3 h-3" />
-                <span>Tambah Biaya</span>
-              </button>
+              <input
+                type="number"
+                step="any"
+                min={0}
+                required
+                value={actualQty}
+                onChange={(e) => setActualQty(Number(e.target.value))}
+                className="w-full px-3 py-2 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-lg tabular-nums"
+              />
             </div>
 
-            {costItemsDraft.length === 0 ? (
-              <p className="text-[11px] text-[#8A7163]">
-                Tidak ada biaya tambahan (seperti gas, listrik, kemasan, atau tenaga kerja) yang ditambahkan.
-              </p>
-            ) : (
-              <div className="space-y-2.5">
-                {costItemsDraft.map((row, idx) => (
-                  <div
-                    key={idx}
-                    className="p-2.5 rounded-md bg-white border border-[#E5D9C8] space-y-2"
-                  >
-                    <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
-                      <div className="sm:col-span-5">
-                        <label className="block text-[11px] text-[#6F574A] mb-1">
-                          Jenis Biaya
-                        </label>
-                        <input
-                          type="text"
-                          value={row.cost_type}
-                          onChange={(e) =>
-                            handleUpdateCostItemRow(idx, { cost_type: e.target.value })
-                          }
-                          placeholder="Gas / Listrik / Tenaga"
-                          className="w-full px-2.5 py-1.5 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-md"
-                        />
-                      </div>
-                      <div className="sm:col-span-5">
-                        <label className="block text-[11px] text-[#6F574A] mb-1">
-                          Nominal (IDR)
-                        </label>
-                        <input
-                          type="number"
-                          min={0}
-                          value={row.amount}
-                          onChange={(e) =>
-                            handleUpdateCostItemRow(idx, {
-                              amount: Number(e.target.value),
-                            })
-                          }
-                          className="w-full px-2.5 py-1.5 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-md tabular-nums"
-                        />
-                      </div>
+            <div className="p-3.5 rounded-lg bg-[#FAF6F0] border border-[#EFE6DA] space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-xs font-medium text-[#2B1B12]">
+                  Biaya Tambahan Produksi (Opsional)
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddCostItemRow}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium bg-white border border-[#D9CBB8] text-[#362015] hover:bg-[#EFE6DA] cursor-pointer"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>Tambah Biaya</span>
+                </button>
+              </div>
+
+              {costItemsDraft.length === 0 ? (
+                <p className="text-[11px] text-[#8A7163]">
+                  Tidak ada biaya tambahan (seperti gas, listrik, kemasan, atau tenaga kerja) yang ditambahkan.
+                </p>
+              ) : (
+                <div className="space-y-2.5">
+                  {costItemsDraft.map((row, idx) => (
+                    <div
+                      key={idx}
+                      className="p-2.5 rounded-md bg-white border border-[#E5D9C8] space-y-2"
+                    >
+                      <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+                        <div className="sm:col-span-5">
+                          <label className="block text-[11px] text-[#6F574A] mb-1">
+                            Jenis Biaya
+                          </label>
+                          <input
+                            type="text"
+                            value={row.cost_type}
+                            onChange={(e) =>
+                              handleUpdateCostItemRow(idx, { cost_type: e.target.value })
+                            }
+                            placeholder="Gas / Listrik / Tenaga"
+                            className="w-full px-2.5 py-1.5 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-md"
+                          />
+                        </div>
+                        <div className="sm:col-span-5">
+                          <label className="block text-[11px] text-[#6F574A] mb-1">
+                            Nominal (IDR)
+                          </label>
+                          <input
+                            type="number"
+                            step="any"
+                            min={0}
+                            value={row.amount}
+                            onChange={(e) =>
+                              handleUpdateCostItemRow(idx, {
+                                amount: Number(e.target.value),
+                              })
+                            }
+                            className="w-full px-2.5 py-1.5 text-xs bg-[#FAF6F0] border border-[#E5D9C8] rounded-md tabular-nums"
+                          />
+                        </div>
                       <div className="sm:col-span-2 flex justify-end">
                         <button
                           type="button"

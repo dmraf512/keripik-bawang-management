@@ -8,9 +8,28 @@ export function formatIDR(amount: number): string {
   }).format(safe);
 }
 
-export function formatNumberID(value: number): string {
+export function formatDecimalIDR(amount: number, maxDecimals = 4): string {
+  const safe = Number.isFinite(amount) ? amount : 0;
+  const hasDecimals = Math.abs(safe - Math.round(safe)) > 1e-6;
+  return new Intl.NumberFormat('id-ID', {
+    style: 'currency',
+    currency: 'IDR',
+    minimumFractionDigits: hasDecimals ? 2 : 0,
+    maximumFractionDigits: hasDecimals ? maxDecimals : 0,
+  }).format(safe);
+}
+
+export function formatNumberID(value: number, maxDecimals = 4): string {
   const safe = Number.isFinite(value) ? value : 0;
-  return new Intl.NumberFormat('id-ID').format(safe);
+  return new Intl.NumberFormat('id-ID', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: maxDecimals,
+  }).format(safe);
+}
+
+export function formatQuantity(value: number, unit?: string | null): string {
+  const formatted = formatNumberID(value, 4);
+  return unit ? `${formatted} ${unit}` : formatted;
 }
 
 function parseDateLocal(isoDate: string): Date | null {
@@ -93,6 +112,8 @@ export function isCashOutflowType(transactionType: string): boolean {
     t.includes('withdraw') ||
     t.includes('purchase') ||
     t.includes('tarik') ||
+    t.includes('penarikan') ||
+    t.includes('prive') ||
     t.includes('debit') ||
     t.includes('pengeluaran') ||
     t.includes('pembelian')
@@ -101,7 +122,12 @@ export function isCashOutflowType(transactionType: string): boolean {
 
 export function isCapitalWithdrawalType(transactionType: string): boolean {
   const t = (transactionType || '').toLowerCase();
-  return t.includes('tarik') || t.includes('withdraw') || t.includes('prive');
+  return (
+    t.includes('tarik') ||
+    t.includes('penarikan') ||
+    t.includes('withdraw') ||
+    t.includes('prive')
+  );
 }
 
 export function downloadCSV(
@@ -110,7 +136,10 @@ export function downloadCSV(
   rows: (string | number)[][]
 ): void {
   const escapeCell = (cell: string | number) => {
-    const str = String(cell ?? '');
+    let str = String(cell ?? '');
+    if (typeof cell === 'string' && /^[=+\-@\t\r]/.test(str)) {
+      str = `'${str}`;
+    }
     if (str.includes(',') || str.includes('"') || str.includes('\n')) {
       return `"${str.replace(/"/g, '""')}"`;
     }

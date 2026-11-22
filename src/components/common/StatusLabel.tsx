@@ -76,10 +76,30 @@ export const OrderStatusLabel: React.FC<{ status: string }> = ({ status }) => {
   }
 };
 
+export function normalizePaymentStatusLabel(
+  status: string
+): 'Belum Bayar' | 'DP / Sebagian' | 'Lunas' {
+  const s = status.trim().toLowerCase();
+  if (s === 'lunas' || s === 'paid' || s === 'settled' || s === 'full') {
+    return 'Lunas';
+  }
+  if (
+    s === 'dp / sebagian' ||
+    s === 'dp' ||
+    s === 'sebagian' ||
+    s === 'partial' ||
+    s === 'partially_paid'
+  ) {
+    return 'DP / Sebagian';
+  }
+  return 'Belum Bayar';
+}
+
 export const PaymentStatusLabel: React.FC<{
-  status: 'Belum Bayar' | 'DP / Sebagian' | 'Lunas';
+  status: string;
 }> = ({ status }) => {
-  switch (status) {
+  const normalized = normalizePaymentStatusLabel(status);
+  switch (normalized) {
     case 'Lunas':
       return (
         <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[#1E6B43] whitespace-nowrap">

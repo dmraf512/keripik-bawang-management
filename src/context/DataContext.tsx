@@ -1,8 +1,15 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { useAuth } from './AuthContext';
 import { EMPTY_SUPABASE_STATE, supabaseService } from '../services/supabaseService';
 import { SupabaseBusinessState } from '../types/supabase';
-import { mapSupabaseDatabaseError } from '../lib/supabase';
+import { ADMIN_USER_ID, mapSupabaseDatabaseError } from '../lib/supabase';
 
 export interface NotificationItem {
   id: string;
@@ -37,6 +44,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isMutating, setIsMutating] = useState<boolean>(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const mutatingLockRef = useRef<boolean>(false);
 
   const dismissNotification = useCallback((id: string) => {
     setNotifications((prev) => prev.filter((n) => n.id !== id));
@@ -65,7 +73,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshData = useCallback(
     async (initial = false) => {
-      if (!session || !user) return;
+      if (!session || !user || user.id !== ADMIN_USER_ID) return;
       if (initial) {
         setIsLoading(true);
       } else {
@@ -89,7 +97,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   useEffect(() => {
-    if (session && user) {
+    if (session && user && user.id === ADMIN_USER_ID) {
       void refreshData(true);
     } else {
       setDb(EMPTY_SUPABASE_STATE);
@@ -102,6 +110,15 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       operation: () => Promise<T>,
       successMessage: string
     ): Promise<T | null> => {
+      if (!session || !user || user.id !== ADMIN_USER_ID) {
+        notifyError('Sesi administrator tidak valid. Silakan masuk kembali.');
+        return null;
+      }
+      if (mutatingLockRef.current) {
+        return null;
+      }
+
+      mutatingLockRef.current = true;
       setIsMutating(true);
       try {
         const result = await operation();
@@ -114,10 +131,11 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         notifyError(message);
         return null;
       } finally {
+        mutatingLockRef.current = false;
         setIsMutating(false);
       }
     },
-    [refreshData, notifySuccess, notifyError]
+    [session, user, refreshData, notifySuccess, notifyError]
   );
 
   return (

@@ -1,35 +1,52 @@
 import { mapSupabaseDatabaseError, supabase } from '../lib/supabase';
 import {
   BusinessProfileRow,
+  CashAccountBalanceView,
   CashAccountRow,
   CashTransactionRow,
   CapitalTransactionRow,
   CustomerRow,
+  DeleteExpenseRpcArgs,
+  DeleteExpenseRpcReturn,
   ExpenseRow,
   FinishedGoodsMovementRow,
+  FinishedGoodsStockView,
+  IngredientAdjustmentType,
   IngredientPurchaseItemRow,
   IngredientPurchaseRow,
   IngredientRow,
   IngredientStockMovementRow,
+  IngredientStockView,
+  MaterialType,
   OrderItemRow,
   OrderPaymentRow,
+  OrderPaymentStatusView,
   OrderRow,
   ProductRecipeItemRow,
   ProductRecipeRow,
   ProductRow,
   ProductSkuRow,
   ProductVariantRow,
+  ProductionBatchCostView,
   ProductionBatchRow,
   ProductionCostItemRow,
   ProductionMaterialRow,
   PurchasePaymentRow,
+  PurchasePaymentStatusView,
+  SalesSummaryView,
+  SkuRecipeHppView,
   SupabaseBusinessState,
 } from '../types/supabase';
+import {
+  convertToCanonicalQuantity,
+  getCanonicalUnit,
+  roundPrecision,
+} from '../utils/units';
 
 function requireClient() {
   if (!supabase) {
     throw new Error(
-      'Klien Supabase belum terkonfigurasi. Periksa VITE_SUPABASE_URL dan VITE_SUPABASE_PUBLISHABLE_KEY.'
+      'Klien Supabase belum terkonfigurasi. Periksa VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY.'
     );
   }
   return supabase;
@@ -66,6 +83,14 @@ export const EMPTY_SUPABASE_STATE: SupabaseBusinessState = {
   capitalTransactions: [],
   cashAccounts: [],
   cashTransactions: [],
+  cashAccountBalances: [],
+  finishedGoodsStock: [],
+  ingredientStock: [],
+  orderPaymentStatus: [],
+  productionBatchCosts: [],
+  purchasePaymentStatus: [],
+  salesSummary: [],
+  skuRecipeHpp: [],
 };
 
 export const supabaseService = {
@@ -96,6 +121,14 @@ export const supabaseService = {
       capitalTransactionsRes,
       cashAccountsRes,
       cashTransactionsRes,
+      cashAccountBalancesRes,
+      finishedGoodsStockRes,
+      ingredientStockRes,
+      orderPaymentStatusRes,
+      productionBatchCostsRes,
+      purchasePaymentStatusRes,
+      salesSummaryRes,
+      skuRecipeHppRes,
     ] = await Promise.all([
       client.from('business_profiles').select('*').order('created_at', { ascending: true }),
       client.from('customers').select('*').order('name', { ascending: true }),
@@ -120,6 +153,14 @@ export const supabaseService = {
       client.from('capital_transactions').select('*').order('transaction_date', { ascending: false }).order('created_at', { ascending: false }),
       client.from('cash_accounts').select('*').order('created_at', { ascending: true }),
       client.from('cash_transactions').select('*').order('transaction_date', { ascending: false }).order('created_at', { ascending: false }),
+      client.from('v_cash_account_balances').select('*'),
+      client.from('v_finished_goods_stock').select('*'),
+      client.from('v_ingredient_stock').select('*'),
+      client.from('v_order_payment_status').select('*'),
+      client.from('v_production_batch_costs').select('*'),
+      client.from('v_purchase_payment_status').select('*'),
+      client.from('v_sales_summary').select('*'),
+      client.from('v_sku_recipe_hpp').select('*'),
     ]);
 
     return {
@@ -146,6 +187,14 @@ export const supabaseService = {
       capitalTransactions: unwrap<CapitalTransactionRow[]>(capitalTransactionsRes, 'capital_transactions') ?? [],
       cashAccounts: unwrap<CashAccountRow[]>(cashAccountsRes, 'cash_accounts') ?? [],
       cashTransactions: unwrap<CashTransactionRow[]>(cashTransactionsRes, 'cash_transactions') ?? [],
+      cashAccountBalances: unwrap<CashAccountBalanceView[]>(cashAccountBalancesRes, 'v_cash_account_balances') ?? [],
+      finishedGoodsStock: unwrap<FinishedGoodsStockView[]>(finishedGoodsStockRes, 'v_finished_goods_stock') ?? [],
+      ingredientStock: unwrap<IngredientStockView[]>(ingredientStockRes, 'v_ingredient_stock') ?? [],
+      orderPaymentStatus: unwrap<OrderPaymentStatusView[]>(orderPaymentStatusRes, 'v_order_payment_status') ?? [],
+      productionBatchCosts: unwrap<ProductionBatchCostView[]>(productionBatchCostsRes, 'v_production_batch_costs') ?? [],
+      purchasePaymentStatus: unwrap<PurchasePaymentStatusView[]>(purchasePaymentStatusRes, 'v_purchase_payment_status') ?? [],
+      salesSummary: unwrap<SalesSummaryView[]>(salesSummaryRes, 'v_sales_summary') ?? [],
+      skuRecipeHpp: unwrap<SkuRecipeHppView[]>(skuRecipeHppRes, 'v_sku_recipe_hpp') ?? [],
     };
   },
 
@@ -224,6 +273,18 @@ export const supabaseService = {
 
   async deleteCustomer(id: string): Promise<void> {
     const client = requireClient();
+    const ordersRes = await client
+      .from('orders')
+      .select('id')
+      .eq('customer_id', id)
+      .limit(1);
+    if (ordersRes.error) throw new Error(mapSupabaseDatabaseError(ordersRes.error));
+    if ((ordersRes.data?.length ?? 0) > 0) {
+      throw new Error(
+        'Pelanggan tidak dapat dihapus karena masih memiliki riwayat pesanan di database.'
+      );
+    }
+
     const res = await client.from('customers').delete().eq('id', id);
     if (res.error) throw new Error(mapSupabaseDatabaseError(res.error));
   },
@@ -261,6 +322,46 @@ export const supabaseService = {
       .select()
       .single();
     return unwrap<ProductVariantRow>(res, 'Gagal menambah varian produk');
+  },
+
+  async createVariantWithOptionalProduct(input: {
+    product_id?: string;
+    default_product_name: string;
+    default_product_description?: string | null;
+    variant_name: string;
+  }): Promise<ProductVariantRow> {
+    const client = requireClient();
+    let prodId = input.product_id;
+    let createdProdId: string | null = null;
+
+    if (!prodId) {
+      const createdProd = await this.createProduct({
+        name: input.default_product_name,
+        description: input.default_product_description ?? null,
+      });
+      prodId = createdProd.id;
+      createdProdId = createdProd.id;
+    }
+
+    try {
+      return await this.createProductVariant({
+        product_id: prodId,
+        variant_name: input.variant_name,
+      });
+    } catch (err) {
+      const baseMsg = err instanceof Error ? err.message : mapSupabaseDatabaseError(err);
+      if (createdProdId) {
+        const rbRes = await client.from('products').delete().eq('id', createdProdId);
+        if (rbRes.error) {
+          throw new Error(
+            `${baseMsg}. PERINGATAN ROLLBACK: Gagal menghapus produk induk baru (${mapSupabaseDatabaseError(
+              rbRes.error
+            )}).`
+          );
+        }
+      }
+      throw new Error(baseMsg);
+    }
   },
 
   async createProductSku(input: {
@@ -314,17 +415,149 @@ export const supabaseService = {
 
   async deleteProductSku(id: string): Promise<void> {
     const client = requireClient();
+
+    const [orderItemsRes, batchesRes, fgMovRes, recipeRes] = await Promise.all([
+      client.from('order_items').select('id').eq('sku_id', id).limit(1),
+      client.from('production_batches').select('id').eq('sku_id', id).limit(1),
+      client.from('finished_goods_movements').select('id').eq('sku_id', id).limit(1),
+      client.from('product_recipes').select('*').eq('sku_id', id).maybeSingle(),
+    ]);
+
+    if (orderItemsRes.error) throw new Error(mapSupabaseDatabaseError(orderItemsRes.error));
+    if (batchesRes.error) throw new Error(mapSupabaseDatabaseError(batchesRes.error));
+    if (fgMovRes.error) throw new Error(mapSupabaseDatabaseError(fgMovRes.error));
+    if (recipeRes.error) throw new Error(mapSupabaseDatabaseError(recipeRes.error));
+
+    if (
+      (orderItemsRes.data?.length ?? 0) > 0 ||
+      (batchesRes.data?.length ?? 0) > 0 ||
+      (fgMovRes.data?.length ?? 0) > 0
+    ) {
+      throw new Error(
+        'SKU tidak dapat dihapus karena sudah terhubung dengan pesanan, batch produksi, atau mutasi stok barang jadi. Nonaktifkan SKU melalui tombol Ubah.'
+      );
+    }
+
+    const recipeSnapshot = recipeRes.data as ProductRecipeRow | null;
+    let recipeItemsSnapshot: ProductRecipeItemRow[] = [];
+
+    if (recipeSnapshot) {
+      const itemsSnapRes = await client
+        .from('product_recipe_items')
+        .select('*')
+        .eq('recipe_id', recipeSnapshot.id);
+      if (itemsSnapRes.error) {
+        throw new Error(mapSupabaseDatabaseError(itemsSnapRes.error));
+      }
+      recipeItemsSnapshot = (itemsSnapRes.data ?? []) as ProductRecipeItemRow[];
+
+      const delRecItems = await client
+        .from('product_recipe_items')
+        .delete()
+        .eq('recipe_id', recipeSnapshot.id);
+      if (delRecItems.error) {
+        throw new Error(mapSupabaseDatabaseError(delRecItems.error));
+      }
+
+      const delRec = await client
+        .from('product_recipes')
+        .delete()
+        .eq('id', recipeSnapshot.id);
+      if (delRec.error) {
+        const rbErrors: string[] = [];
+        if (recipeItemsSnapshot.length > 0) {
+          const rbItems = await client.from('product_recipe_items').insert(
+            recipeItemsSnapshot.map((prev) => ({
+              id: prev.id,
+              recipe_id: prev.recipe_id,
+              ingredient_id: prev.ingredient_id,
+              quantity: prev.quantity,
+              input_quantity: prev.input_quantity ?? prev.quantity,
+              input_unit: prev.input_unit ?? null,
+              conversion_factor: prev.conversion_factor ?? 1,
+              notes: prev.notes ?? null,
+            }))
+          );
+          if (rbItems.error) rbErrors.push(mapSupabaseDatabaseError(rbItems.error));
+        }
+        const rbMsg =
+          rbErrors.length > 0
+            ? ` PERINGATAN ROLLBACK: Pemulihan item resep gagal (${rbErrors.join('; ')}).`
+            : '';
+        throw new Error(`${mapSupabaseDatabaseError(delRec.error)}${rbMsg}`);
+      }
+    }
+
     const res = await client.from('product_skus').delete().eq('id', id);
-    if (res.error) throw new Error(mapSupabaseDatabaseError(res.error));
+    if (res.error) {
+      const rbErrors: string[] = [];
+      if (recipeSnapshot) {
+        const rbRec = await client.from('product_recipes').insert({
+          id: recipeSnapshot.id,
+          sku_id: recipeSnapshot.sku_id,
+          recipe_name: recipeSnapshot.recipe_name,
+          notes: recipeSnapshot.notes,
+          is_active: recipeSnapshot.is_active,
+        });
+        if (rbRec.error) {
+          rbErrors.push(`header resep: ${mapSupabaseDatabaseError(rbRec.error)}`);
+        } else if (recipeItemsSnapshot.length > 0) {
+          const rbItems = await client.from('product_recipe_items').insert(
+            recipeItemsSnapshot.map((prev) => ({
+              id: prev.id,
+              recipe_id: prev.recipe_id,
+              ingredient_id: prev.ingredient_id,
+              quantity: prev.quantity,
+              input_quantity: prev.input_quantity ?? prev.quantity,
+              input_unit: prev.input_unit ?? null,
+              conversion_factor: prev.conversion_factor ?? 1,
+              notes: prev.notes ?? null,
+            }))
+          );
+          if (rbItems.error) {
+            rbErrors.push(`item resep: ${mapSupabaseDatabaseError(rbItems.error)}`);
+          }
+        }
+      }
+      const rbMsg =
+        rbErrors.length > 0
+          ? ` PERINGATAN ROLLBACK: Gagal memulihkan resep terkait (${rbErrors.join('; ')}).`
+          : '';
+      throw new Error(`${mapSupabaseDatabaseError(res.error)}${rbMsg}`);
+    }
   },
 
   async saveProductRecipe(input: {
     sku_id: string;
     recipe_name?: string;
     notes?: string | null;
-    items: { ingredient_id: string; quantity: number; notes?: string | null }[];
+    items: {
+      ingredient_id: string;
+      quantity: number;
+      input_quantity?: number;
+      input_unit?: string;
+      conversion_factor?: number;
+      notes?: string | null;
+    }[];
   }): Promise<void> {
     const client = requireClient();
+
+    if (input.items.length === 0) {
+      throw new Error('Resep harus memiliki minimal 1 bahan baku.');
+    }
+
+    const uniqueIds = new Set<string>();
+    for (const item of input.items) {
+      if (!Number.isFinite(item.quantity) || item.quantity <= 0) {
+        throw new Error('Jumlah takaran bahan dalam resep harus bernilai lebih dari 0.');
+      }
+      if (uniqueIds.has(item.ingredient_id)) {
+        throw new Error(
+          'Bahan baku yang sama tidak boleh dimasukkan lebih dari satu kali dalam satu resep.'
+        );
+      }
+      uniqueIds.add(item.ingredient_id);
+    }
 
     let resolvedRecipeName = input.recipe_name?.trim() ?? '';
     if (!resolvedRecipeName) {
@@ -362,7 +595,7 @@ export const supabaseService = {
 
     const existingRes = await client
       .from('product_recipes')
-      .select('id')
+      .select('id, recipe_name, notes, is_active')
       .eq('sku_id', input.sku_id)
       .maybeSingle();
 
@@ -370,10 +603,21 @@ export const supabaseService = {
       throw new Error(mapSupabaseDatabaseError(existingRes.error));
     }
 
-    let recipeId = existingRes.data?.id as string | undefined;
+    const existingHeader = existingRes.data as
+      | { id: string; recipe_name: string; notes: string | null; is_active: boolean }
+      | null;
+    let recipeId = existingHeader?.id;
+    let previousItemsSnapshot: ProductRecipeItemRow[] = [];
     let isNewlyCreated = false;
 
     if (recipeId) {
+      const snapRes = await client
+        .from('product_recipe_items')
+        .select('*')
+        .eq('recipe_id', recipeId);
+      if (snapRes.error) throw new Error(mapSupabaseDatabaseError(snapRes.error));
+      previousItemsSnapshot = (snapRes.data ?? []) as ProductRecipeItemRow[];
+
       const updRes = await client
         .from('product_recipes')
         .update({
@@ -388,7 +632,22 @@ export const supabaseService = {
         .from('product_recipe_items')
         .delete()
         .eq('recipe_id', recipeId);
-      if (delItems.error) throw new Error(mapSupabaseDatabaseError(delItems.error));
+      if (delItems.error) {
+        const rbHeader = await client
+          .from('product_recipes')
+          .update({
+            recipe_name: existingHeader!.recipe_name,
+            notes: existingHeader!.notes,
+            is_active: existingHeader!.is_active,
+          })
+          .eq('id', recipeId);
+        const rbMsg = rbHeader.error
+          ? ` PERINGATAN ROLLBACK: Gagal memulihkan header resep (${mapSupabaseDatabaseError(
+              rbHeader.error
+            )}).`
+          : '';
+        throw new Error(`${mapSupabaseDatabaseError(delItems.error)}${rbMsg}`);
+      }
     } else {
       const insRes = await client
         .from('product_recipes')
@@ -405,64 +664,199 @@ export const supabaseService = {
       isNewlyCreated = true;
     }
 
-    if (input.items.length > 0) {
-      const insItems = await client.from('product_recipe_items').insert(
-        input.items.map((item) => ({
-          recipe_id: recipeId!,
-          ingredient_id: item.ingredient_id,
-          quantity: item.quantity,
-          notes: item.notes || null,
-        }))
-      );
-      if (insItems.error) {
-        if (isNewlyCreated && recipeId) {
-          await client.from('product_recipes').delete().eq('id', recipeId);
+    const insItems = await client.from('product_recipe_items').insert(
+      input.items.map((item) => ({
+        recipe_id: recipeId!,
+        ingredient_id: item.ingredient_id,
+        quantity: roundPrecision(item.quantity, 4),
+        input_quantity: roundPrecision(item.input_quantity ?? item.quantity, 4),
+        input_unit: item.input_unit ?? null,
+        conversion_factor: item.conversion_factor ?? 1,
+        notes: item.notes || null,
+      }))
+    );
+
+    if (insItems.error) {
+      const rollbackErrors: string[] = [];
+      if (isNewlyCreated && recipeId) {
+        const delRec = await client.from('product_recipes').delete().eq('id', recipeId);
+        if (delRec.error) {
+          rollbackErrors.push(
+            `hapus header resep baru: ${mapSupabaseDatabaseError(delRec.error)}`
+          );
         }
-        throw new Error(mapSupabaseDatabaseError(insItems.error));
+      } else if (recipeId && existingHeader) {
+        const rbHeader = await client
+          .from('product_recipes')
+          .update({
+            recipe_name: existingHeader.recipe_name,
+            notes: existingHeader.notes,
+            is_active: existingHeader.is_active,
+          })
+          .eq('id', recipeId);
+        if (rbHeader.error) {
+          rollbackErrors.push(
+            `pulihkan header resep: ${mapSupabaseDatabaseError(rbHeader.error)}`
+          );
+        }
+        if (previousItemsSnapshot.length > 0) {
+          const rbItems = await client.from('product_recipe_items').insert(
+            previousItemsSnapshot.map((prev) => ({
+              recipe_id: prev.recipe_id,
+              ingredient_id: prev.ingredient_id,
+              quantity: prev.quantity,
+              input_quantity: prev.input_quantity ?? prev.quantity,
+              input_unit: prev.input_unit ?? null,
+              conversion_factor: prev.conversion_factor ?? 1,
+              notes: prev.notes ?? null,
+            }))
+          );
+          if (rbItems.error) {
+            rollbackErrors.push(
+              `pulihkan item resep sebelumnya: ${mapSupabaseDatabaseError(rbItems.error)}`
+            );
+          }
+        }
       }
+
+      const rollbackSuffix =
+        rollbackErrors.length > 0
+          ? ` PERINGATAN ROLLBACK: Pemulihan resep gagal (${rollbackErrors.join(
+              '; '
+            )}). Harap periksa ulang resep SKU ini.`
+          : '';
+      throw new Error(`${mapSupabaseDatabaseError(insItems.error)}${rollbackSuffix}`);
     }
   },
 
-  // --- Ingredients ---
+  // --- Ingredients & Canonical Unit Conversions ---
+  async convertIngredientQuantity(input: {
+    quantity: number;
+    input_unit: string;
+    material_type: MaterialType;
+  }): Promise<number> {
+    const client = requireClient();
+    const res = await client.rpc('convert_ingredient_quantity', {
+      p_quantity: input.quantity,
+      p_input_unit: input.input_unit,
+      p_material_type: input.material_type,
+    });
+    if (res.error) {
+      return convertToCanonicalQuantity(
+        input.quantity,
+        input.input_unit,
+        input.material_type
+      ).canonicalQuantity;
+    }
+    return Number(res.data ?? 0);
+  },
+
+  async adjustIngredientStock(input: {
+    ingredient_id: string;
+    adjustment_type: IngredientAdjustmentType;
+    quantity: number;
+    unit: string;
+    notes?: string | null;
+  }): Promise<void> {
+    const client = requireClient();
+    if (
+      input.adjustment_type !== 'adjustment_in' &&
+      input.adjustment_type !== 'adjustment_out'
+    ) {
+      throw new Error(
+        'Jenis penyesuaian stok tidak valid. Gunakan adjustment_in atau adjustment_out.'
+      );
+    }
+    const res = await client.rpc('adjust_ingredient_stock', {
+      p_ingredient_id: input.ingredient_id,
+      p_adjustment_type: input.adjustment_type,
+      p_quantity: roundPrecision(input.quantity, 4),
+      p_unit: input.unit,
+      p_notes: input.notes ?? null,
+    });
+    if (res.error) throw new Error(mapSupabaseDatabaseError(res.error));
+  },
+
   async createIngredient(input: {
     name: string;
-    unit: string;
+    material_type: MaterialType;
+    unit?: string;
     current_stock: number;
     average_unit_cost: number;
   }): Promise<IngredientRow> {
     const client = requireClient();
+    const canonicalUnit = input.unit?.trim() || getCanonicalUnit(input.material_type);
+    const initialStock = roundPrecision(
+      Number.isFinite(input.current_stock) ? Math.max(0, input.current_stock) : 0,
+      4
+    );
+    const avgUnitCost = roundPrecision(
+      Number.isFinite(input.average_unit_cost) ? Math.max(0, input.average_unit_cost) : 0,
+      6
+    );
+
+    // Masukkan bahan dengan stok 0 terlebih dahulu, lalu catat stok awal via adjust_ingredient_stock
+    // agar setiap perubahan stok selalu memiliki jejak di ingredient_stock_movements.
     const res = await client
       .from('ingredients')
       .insert({
         name: input.name,
-        unit: input.unit,
-        current_stock: input.current_stock,
-        average_unit_cost: input.average_unit_cost,
+        material_type: input.material_type,
+        unit: canonicalUnit,
+        current_stock: 0,
+        average_unit_cost: avgUnitCost,
         is_active: true,
       })
       .select()
       .single();
-    return unwrap<IngredientRow>(res, 'Gagal menambah bahan baku');
+    const created = unwrap<IngredientRow>(res, 'Gagal menambah bahan baku');
+
+    if (initialStock > 0) {
+      const adjRes = await client.rpc('adjust_ingredient_stock', {
+        p_ingredient_id: created.id,
+        p_adjustment_type: 'adjustment_in' satisfies IngredientAdjustmentType,
+        p_quantity: initialStock,
+        p_unit: canonicalUnit,
+        p_notes: 'Stok awal saat penambahan bahan baku',
+      });
+      if (adjRes.error) {
+        const rbRes = await client.from('ingredients').delete().eq('id', created.id);
+        const rbSuffix = rbRes.error
+          ? ` PERINGATAN ROLLBACK: Bahan baru (${created.name}) gagal dihapus otomatis (${mapSupabaseDatabaseError(
+              rbRes.error
+            )}).`
+          : '';
+        throw new Error(
+          `Gagal mencatat mutasi stok awal: ${mapSupabaseDatabaseError(
+            adjRes.error
+          )}${rbSuffix}`
+        );
+      }
+      return { ...created, current_stock: initialStock };
+    }
+
+    return created;
   },
 
   async updateIngredient(
     id: string,
     input: {
       name: string;
-      unit: string;
-      current_stock: number;
+      material_type: MaterialType;
+      unit?: string;
       average_unit_cost: number;
       is_active: boolean;
     }
   ): Promise<IngredientRow> {
     const client = requireClient();
+    const canonicalUnit = input.unit?.trim() || getCanonicalUnit(input.material_type);
     const res = await client
       .from('ingredients')
       .update({
         name: input.name,
-        unit: input.unit,
-        current_stock: input.current_stock,
-        average_unit_cost: input.average_unit_cost,
+        material_type: input.material_type,
+        unit: canonicalUnit,
+        average_unit_cost: roundPrecision(Math.max(0, input.average_unit_cost), 6),
         is_active: input.is_active,
       })
       .eq('id', id)
@@ -473,6 +867,38 @@ export const supabaseService = {
 
   async deleteIngredient(id: string): Promise<void> {
     const client = requireClient();
+
+    const [ingRes, purchaseRes, movRes, prodMatRes, recipeRes] = await Promise.all([
+      client.from('ingredients').select('id, current_stock').eq('id', id).maybeSingle(),
+      client.from('ingredient_purchase_items').select('id').eq('ingredient_id', id).limit(1),
+      client.from('ingredient_stock_movements').select('id').eq('ingredient_id', id).limit(1),
+      client.from('production_materials').select('id').eq('ingredient_id', id).limit(1),
+      client.from('product_recipe_items').select('id').eq('ingredient_id', id).limit(1),
+    ]);
+
+    if (ingRes.error) throw new Error(mapSupabaseDatabaseError(ingRes.error));
+    if (purchaseRes.error) throw new Error(mapSupabaseDatabaseError(purchaseRes.error));
+    if (movRes.error) throw new Error(mapSupabaseDatabaseError(movRes.error));
+    if (prodMatRes.error) throw new Error(mapSupabaseDatabaseError(prodMatRes.error));
+    if (recipeRes.error) throw new Error(mapSupabaseDatabaseError(recipeRes.error));
+
+    if (
+      Number(ingRes.data?.current_stock ?? 0) > 0 ||
+      (purchaseRes.data?.length ?? 0) > 0 ||
+      (movRes.data?.length ?? 0) > 0 ||
+      (prodMatRes.data?.length ?? 0) > 0
+    ) {
+      throw new Error(
+        'Bahan baku yang masih memiliki stok atau riwayat pembelian, mutasi stok, maupun produksi tidak dapat dihapus. Nonaktifkan bahan melalui tombol Ubah.'
+      );
+    }
+
+    if ((recipeRes.data?.length ?? 0) > 0) {
+      throw new Error(
+        'Bahan baku tidak dapat dihapus karena masih digunakan dalam resep produk.'
+      );
+    }
+
     const res = await client.from('ingredients').delete().eq('id', id);
     if (res.error) throw new Error(mapSupabaseDatabaseError(res.error));
   },
@@ -553,12 +979,16 @@ export const supabaseService = {
         }))
       );
       if (itemsRes.error) {
-        // Bersihkan header order yang baru dibuat agar tidak meninggalkan data yatim
-        await client.from('orders').delete().eq('id', createdOrder.id);
+        const rbOrder = await client.from('orders').delete().eq('id', createdOrder.id);
+        const rbSuffix = rbOrder.error
+          ? ` PERINGATAN ROLLBACK: Header pesanan gagal dibersihkan (${mapSupabaseDatabaseError(
+              rbOrder.error
+            )}).`
+          : '';
         throw new Error(
           `Item pesanan gagal disimpan: ${mapSupabaseDatabaseError(
             itemsRes.error
-          )}`
+          )}${rbSuffix}`
         );
       }
     }
@@ -573,10 +1003,31 @@ export const supabaseService = {
         p_notes: input.initial_payment.notes ?? null,
       });
       if (rpcRes.error) {
+        const rbErrors: string[] = [];
+        const rbItems = await client
+          .from('order_items')
+          .delete()
+          .eq('order_id', createdOrder.id);
+        if (rbItems.error) {
+          rbErrors.push(`hapus item: ${mapSupabaseDatabaseError(rbItems.error)}`);
+        }
+        const rbOrder = await client
+          .from('orders')
+          .delete()
+          .eq('id', createdOrder.id);
+        if (rbOrder.error) {
+          rbErrors.push(`hapus pesanan: ${mapSupabaseDatabaseError(rbOrder.error)}`);
+        }
+        const rbSuffix =
+          rbErrors.length > 0
+            ? ` PERINGATAN ROLLBACK: Pembersihan pesanan gagal (${rbErrors.join(
+                '; '
+              )}). Harap periksa pesanan ${createdOrder.order_number}.`
+            : '';
         throw new Error(
-          `Pesanan tersimpan, tetapi pembayaran gagal dicatat: ${mapSupabaseDatabaseError(
+          `Pembayaran awal gagal dicatat sehingga pesanan dibatalkan: ${mapSupabaseDatabaseError(
             rpcRes.error
-          )}`
+          )}${rbSuffix}`
         );
       }
     }
@@ -595,23 +1046,61 @@ export const supabaseService = {
 
   async deleteOrder(orderId: string): Promise<void> {
     const client = requireClient();
-    const [paymentsRes, batchesRes] = await Promise.all([
+    const [paymentsRes, batchesRes, fgMovRes, cashTxRes] = await Promise.all([
       client.from('order_payments').select('id').eq('order_id', orderId).limit(1),
       client.from('production_batches').select('id').eq('order_id', orderId).limit(1),
+      client.from('finished_goods_movements').select('id').eq('order_id', orderId).limit(1),
+      client.from('cash_transactions').select('id').eq('reference_id', orderId).limit(1),
     ]);
     if (paymentsRes.error) throw new Error(mapSupabaseDatabaseError(paymentsRes.error));
     if (batchesRes.error) throw new Error(mapSupabaseDatabaseError(batchesRes.error));
-    if ((paymentsRes.data?.length ?? 0) > 0 || (batchesRes.data?.length ?? 0) > 0) {
+    if (fgMovRes.error) throw new Error(mapSupabaseDatabaseError(fgMovRes.error));
+    if (cashTxRes.error) throw new Error(mapSupabaseDatabaseError(cashTxRes.error));
+    if (
+      (paymentsRes.data?.length ?? 0) > 0 ||
+      (batchesRes.data?.length ?? 0) > 0 ||
+      (fgMovRes.data?.length ?? 0) > 0 ||
+      (cashTxRes.data?.length ?? 0) > 0
+    ) {
       throw new Error(
-        'Pesanan yang sudah memiliki pembayaran atau batch produksi tidak dapat dihapus.'
+        'Pesanan yang sudah memiliki pembayaran, batch produksi, mutasi stok jadi, atau mutasi kas tidak dapat dihapus.'
       );
     }
+
+    const itemsSnapRes = await client
+      .from('order_items')
+      .select('*')
+      .eq('order_id', orderId);
+    if (itemsSnapRes.error) {
+      throw new Error(mapSupabaseDatabaseError(itemsSnapRes.error));
+    }
+    const itemsSnapshot = (itemsSnapRes.data ?? []) as OrderItemRow[];
 
     const delItems = await client.from('order_items').delete().eq('order_id', orderId);
     if (delItems.error) throw new Error(mapSupabaseDatabaseError(delItems.error));
 
     const res = await client.from('orders').delete().eq('id', orderId);
-    if (res.error) throw new Error(mapSupabaseDatabaseError(res.error));
+    if (res.error) {
+      let rbSuffix = '';
+      if (itemsSnapshot.length > 0) {
+        const rbItems = await client.from('order_items').insert(
+          itemsSnapshot.map((it) => ({
+            id: it.id,
+            order_id: it.order_id,
+            sku_id: it.sku_id,
+            quantity: it.quantity,
+            unit_price: it.unit_price,
+            subtotal: it.subtotal,
+          }))
+        );
+        if (rbItems.error) {
+          rbSuffix = ` PERINGATAN ROLLBACK: Gagal memulihkan item pesanan (${mapSupabaseDatabaseError(
+            rbItems.error
+          )}).`;
+        }
+      }
+      throw new Error(`${mapSupabaseDatabaseError(res.error)}${rbSuffix}`);
+    }
   },
 
   async registerOrderPayment(input: {
@@ -639,15 +1128,32 @@ export const supabaseService = {
     supplier_name: string | null;
     purchase_date: string;
     notes?: string | null;
-    items: { ingredient_id: string; quantity: number; unit_price: number }[];
+    items: {
+      ingredient_id: string;
+      input_quantity: number;
+      input_unit: string;
+      input_unit_price: number;
+      conversion_factor: number;
+      quantity: number;
+      unit_price: number;
+    }[];
   }): Promise<void> {
     const client = requireClient();
-    const enrichedItems = input.items.map((item) => ({
-      ingredient_id: item.ingredient_id,
-      quantity: item.quantity,
-      unit_price: item.unit_price,
-      subtotal: Number((item.quantity * item.unit_price).toFixed(2)),
-    }));
+    const enrichedItems = input.items.map((item) => {
+      const canonicalQty = roundPrecision(item.quantity, 4);
+      const canonicalUnitPrice = roundPrecision(item.unit_price, 6);
+      const subtotal = roundPrecision(item.input_quantity * item.input_unit_price, 6);
+      return {
+        ingredient_id: item.ingredient_id,
+        quantity: canonicalQty,
+        unit_price: canonicalUnitPrice,
+        subtotal,
+        input_quantity: roundPrecision(item.input_quantity, 4),
+        input_unit: item.input_unit,
+        input_unit_price: roundPrecision(item.input_unit_price, 6),
+        conversion_factor: item.conversion_factor,
+      };
+    });
     const res = await client.rpc('register_ingredient_purchase', {
       p_supplier_name: input.supplier_name,
       p_purchase_date: input.purchase_date,
@@ -738,10 +1244,23 @@ export const supabaseService = {
     if (res.error) throw new Error(mapSupabaseDatabaseError(res.error));
   },
 
-  async deleteExpense(expenseId: string): Promise<void> {
+  async deleteExpense(expenseId: string): Promise<DeleteExpenseRpcReturn> {
     const client = requireClient();
-    const res = await client.from('expenses').delete().eq('id', expenseId);
-    if (res.error) throw new Error(mapSupabaseDatabaseError(res.error));
+    const args: DeleteExpenseRpcArgs = {
+      p_expense_id: expenseId,
+    };
+    const res = await client.rpc('delete_expense', args);
+    if (res.error) {
+      throw new Error(
+        `Gagal menghapus pengeluaran: ${mapSupabaseDatabaseError(res.error)}`
+      );
+    }
+    if (typeof res.data !== 'string' || !res.data.trim()) {
+      throw new Error(
+        'Fungsi delete_expense tidak mengembalikan UUID pengeluaran yang valid.'
+      );
+    }
+    return res.data;
   },
 
   async registerCapitalTransaction(input: {

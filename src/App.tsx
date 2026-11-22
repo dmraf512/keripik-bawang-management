@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { AlertCircle, Loader2, RefreshCw } from 'lucide-react';
+import { ADMIN_USER_ID } from './lib/supabase';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { DataProvider, useBusinessData } from './context/DataContext';
 import { PageId } from './types/supabase';
@@ -181,7 +182,7 @@ function AuthGate() {
     );
   }
 
-  if (!session || !user) {
+  if (!session || !user || user.id !== ADMIN_USER_ID) {
     return <LoginPage />;
   }
 
