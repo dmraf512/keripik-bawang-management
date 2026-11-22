@@ -165,9 +165,11 @@ export interface ProductionCostItemRow {
 export interface ProductRecipeRow {
   id: string;
   sku_id: string;
+  recipe_name: string;
   notes: string | null;
   is_active: boolean;
   created_at: string;
+  updated_at?: string;
 }
 
 export interface ProductRecipeItemRow {

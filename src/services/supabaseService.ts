@@ -320,10 +320,46 @@ export const supabaseService = {
 
   async saveProductRecipe(input: {
     sku_id: string;
+    recipe_name?: string;
     notes?: string | null;
     items: { ingredient_id: string; quantity: number; notes?: string | null }[];
   }): Promise<void> {
     const client = requireClient();
+
+    let resolvedRecipeName = input.recipe_name?.trim() ?? '';
+    if (!resolvedRecipeName) {
+      const { data: skuData } = await client
+        .from('product_skus')
+        .select('package_name, product_variants(variant_name, products(name))')
+        .eq('id', input.sku_id)
+        .maybeSingle();
+
+      if (skuData) {
+        const variantObj = Array.isArray(skuData.product_variants)
+          ? skuData.product_variants[0]
+          : (skuData.product_variants as {
+              variant_name?: string;
+              products?: { name?: string } | { name?: string }[];
+            } | null);
+        const productObj = variantObj?.products
+          ? Array.isArray(variantObj.products)
+            ? variantObj.products[0]
+            : variantObj.products
+          : null;
+
+        resolvedRecipeName = [
+          productObj?.name || 'Keripik Bawang',
+          variantObj?.variant_name,
+          skuData.package_name,
+        ]
+          .filter(Boolean)
+          .join(' - ');
+      }
+    }
+    if (!resolvedRecipeName) {
+      resolvedRecipeName = `Resep SKU ${input.sku_id.slice(0, 8)}`;
+    }
+
     const existingRes = await client
       .from('product_recipes')
       .select('id')
@@ -335,11 +371,16 @@ export const supabaseService = {
     }
 
     let recipeId = existingRes.data?.id as string | undefined;
+    let isNewlyCreated = false;
 
     if (recipeId) {
       const updRes = await client
         .from('product_recipes')
-        .update({ notes: input.notes || null, is_active: true })
+        .update({
+          recipe_name: resolvedRecipeName,
+          notes: input.notes || null,
+          is_active: true,
+        })
         .eq('id', recipeId);
       if (updRes.error) throw new Error(mapSupabaseDatabaseError(updRes.error));
 
@@ -353,6 +394,7 @@ export const supabaseService = {
         .from('product_recipes')
         .insert({
           sku_id: input.sku_id,
+          recipe_name: resolvedRecipeName,
           notes: input.notes || null,
           is_active: true,
         })
@@ -360,6 +402,7 @@ export const supabaseService = {
         .single();
       const created = unwrap<{ id: string }>(insRes, 'Gagal membuat resep produk');
       recipeId = created.id;
+      isNewlyCreated = true;
     }
 
     if (input.items.length > 0) {
@@ -371,7 +414,12 @@ export const supabaseService = {
           notes: item.notes || null,
         }))
       );
-      if (insItems.error) throw new Error(mapSupabaseDatabaseError(insItems.error));
+      if (insItems.error) {
+        if (isNewlyCreated && recipeId) {
+          await client.from('product_recipes').delete().eq('id', recipeId);
+        }
+        throw new Error(mapSupabaseDatabaseError(insItems.error));
+      }
     }
   },
 

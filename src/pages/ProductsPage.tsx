@@ -42,6 +42,32 @@ export const ProductsPage: React.FC = () => {
     [db.products]
   );
 
+  const variantMap = useMemo(
+    () => new Map(db.productVariants.map((v) => [v.id, v])),
+    [db.productVariants]
+  );
+
+  const activeRecipeTarget = useMemo(() => {
+    if (!recipeSkuId) return null;
+    const sku = db.productSkus.find((s) => s.id === recipeSkuId);
+    if (!sku) return null;
+    const variant = variantMap.get(sku.variant_id);
+    const product = variant ? productMap.get(variant.product_id) : undefined;
+    const recipeName = [
+      product?.name || 'Keripik Bawang',
+      variant?.variant_name,
+      sku.package_name,
+    ]
+      .filter(Boolean)
+      .join(' - ');
+    return {
+      sku,
+      variant,
+      product,
+      recipeName,
+    };
+  }, [recipeSkuId, db.productSkus, variantMap, productMap]);
+
   const skusByVariant = useMemo(() => {
     const map = new Map<string, typeof db.productSkus>();
     db.productSkus.forEach((sku) => {
@@ -175,17 +201,18 @@ export const ProductsPage: React.FC = () => {
 
   const handleSaveRecipe = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!recipeSkuId) return;
+    if (!recipeSkuId || !activeRecipeTarget) return;
     const validItems = recipeItems.filter((i) => i.ingredient_id && i.quantity > 0);
 
     const res = await executeMutation(
       () =>
         supabaseService.saveProductRecipe({
           sku_id: recipeSkuId,
+          recipe_name: activeRecipeTarget.recipeName,
           notes: recipeNotes.trim() || null,
           items: validItems,
         }),
-      'Resep produk berhasil diperbarui.'
+      `Resep "${activeRecipeTarget.recipeName}" berhasil disimpan.`
     );
 
     if (res !== null) {
@@ -510,6 +537,17 @@ export const ProductsPage: React.FC = () => {
           </p>
         ) : (
           <form onSubmit={(e) => void handleSaveRecipe(e)} className="space-y-4">
+            {activeRecipeTarget && (
+              <div className="p-3 rounded-lg bg-[#FAF6F0] border border-[#EFE6DA] text-xs">
+                <div className="text-[11px] text-[#7A6154]">
+                  Nama Resep (Otomatis dari Produk, Varian &amp; SKU)
+                </div>
+                <div className="mt-0.5 font-semibold text-[#2B1B12]">
+                  {activeRecipeTarget.recipeName}
+                </div>
+              </div>
+            )}
+
             <div className="space-y-2.5">
               {recipeItems.map((item, idx) => (
                 <div key={idx} className="flex items-center gap-2">
